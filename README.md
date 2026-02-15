@@ -1,28 +1,54 @@
 # Whole Body Motion Tracking
 
-This repository is an extension of the [GentleHumanoid](https://gentle-humanoid.axell.top) training repository, supporting universal, robust, and highly dynamic whole-body motion tracking policy training.
+This repository is an extension of the [GentleHumanoid](https://gentle-humanoid.axell.top) training repository, supporting universal, robust, and highly dynamic whole-body motion tracking policy training with upper-body compliance.
 
 Main features:
 
-*  A **universal** whole-body motion tracking policy,  training and evaluation pipeline.
+*  A **universal** whole-body motion tracking policy, training and evaluation pipeline.
 
-* Dataset support including preprocessing for AMASS and LAFAN.
+* Upper-body **compliance-aware** control for contact-rich interaction.
+
+* Simulation backend based on **mjlab**.
 
 A **demo** of the pretrained policies, shows a single model generalizing across diverse and highly dynamic motions, is available [here](https://motion-tracking.axell.top).
+
+https://github.com/user-attachments/assets/4d210dbf-8023-4270-b094-ab6a2353deda
 
 Instructions for **real-robot deployment** and the use of **pretrained models** on new motion sequences are available in `sim2real` folder.
 
 ## Installation
 
+If you do not have `uv` installed, you can install it following the instructions in the [uv documentation](https://docs.astral.sh/uv/getting-started/installation/).
+
 ```bash
-# 1) clone IsaacLab for editable installation
-git clone https://github.com/isaac-sim/IsaacLab.git third_party/IsaacLab
-git -C third_party/IsaacLab checkout v2.2.0
-# 2) install dependencies via uv
+# this project uses uv for dependency and environment management
 uv sync
 ```
 
 ## Motion Dataset Preparation
+
+<details>
+<summary><b>Quick Start: Download Preprocessed Dataset (Google Drive)</b></summary>
+
+Download link:
+
+- [Google Drive Dataset](https://drive.google.com/drive/folders/1-FBUxllaYwqGIUSCaWg_4inD-u5Tdvi9?usp=sharing)
+
+After downloading, extract it into the repository `dataset/` directory, and you should have the following structure:
+
+```text
+dataset/
+  amass_all/
+    meta.json
+    ...
+  lafan_all/
+    ...
+```
+
+</details>
+
+<details>
+<summary><b>Build Dataset from AMASS/LAFAN with GMR</b></summary>
 
 ### Retargeting with GMR
 
@@ -57,6 +83,8 @@ bash generate_dataset.sh
 
 The dataset will be generated in the `dataset/` directory, and the code will automatically load these datasets. You can also use the `MEMATH` environment variable to specify the dataset root path.
 
+</details>
+
 ## Training
 
 You can use the provided `train.sh` script to run the full training pipeline. Modify the global configuration section in `train.sh` to set your WandB account and other parameters, then run:
@@ -65,7 +93,7 @@ You can use the provided `train.sh` script to run the full training pipeline. Mo
 bash train.sh
 ```
 
-Under standard settings, training takes approximately 14 hours on 4× A100 GPUs.
+Under standard settings, training takes approximately 15 hours on 4× A100 GPUs.
 If GPU memory is constrained, it is recommended to appropriately tune the `NPROC` and `num_envs` parameters in `train.sh` and `cfg/task/G1/G1.yaml`, respectively.
 Such adjustments may increase training time and could affect training performance to some extent.
 

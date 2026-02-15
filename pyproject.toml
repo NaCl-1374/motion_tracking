@@ -8,12 +8,12 @@ version = "0.0.0"
 description = "Whole-body motion tracking training and evaluation pipeline"
 readme = "README.md"
 requires-python = "==3.10.*"
-authors = [{ name = "Axell team" }]
+authors = [{ name = "Axell" }]
 keywords = ["robotics", "reinforcement-learning", "motion-tracking"]
 dependencies = [
   "hydra-core",
   "omegaconf",
-  "mujoco",
+  "mjlab==1.1.1",
   "wandb",
   "moviepy",
   "imageio",
@@ -32,10 +32,7 @@ dependencies = [
   "numpy",
   "h5py",
   "scipy",
-  "markupsafe==2.1.5",
-  "isaacsim[all,extscache]==4.5.0 ; platform_system == 'Linux'",
-  # IsaacLab placeholder; install via editable source (see README for steps).
-  "isaaclab==2.2.0",
+  "markupsafe==2.1.5"
 ]
 
 [tool.setuptools.packages.find]
@@ -50,6 +47,9 @@ url = "https://download.pytorch.org/whl/cu128"
 name = "nvidia"
 url = "https://pypi.nvidia.com"
 
-[tool.uv.sources]
-# Use local editable IsaacLab source to keep config/extension.toml and all subpackages available.
-isaaclab = { path = "third_party/IsaacLab/source/isaaclab", editable = true }
+[tool.uv]
+# mjlab==1.1.1 depends on a pre-release warp-lang.
+prerelease = "allow"
+# Allow resolving a package from later indexes when an earlier index has
+# incompatible versions.
+index-strategy = "unsafe-best-match"

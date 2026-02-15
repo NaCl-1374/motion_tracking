@@ -96,7 +96,7 @@ class TargetJointPosObs:
     @property
     def size(self) -> int:
         n_j = getattr(self.policy, "n_joints", 0)
-        return len(self.future_steps) * n_j
+        return len(self.future_steps) * n_j * 2
 
     def reset(self):
         pass
@@ -111,7 +111,15 @@ class TargetJointPosObs:
         T = self.policy.ref_len
         fut_idx = _clamp_indices(base + self.future_steps, T)
         tgt_joints = self.policy.ref_joint_pos[fut_idx]
-        return tgt_joints.reshape(-1).astype(np.float32)
+        cur_joints = self.policy.controller.qj_isaac.astype(np.float32).reshape(1, -1)
+        tgt_minus_cur = tgt_joints - cur_joints
+        return np.concatenate(
+            [
+                tgt_joints.reshape(-1),
+                tgt_minus_cur.reshape(-1),
+            ],
+            axis=-1,
+        ).astype(np.float32)
 
 class TargetProjectedGravityBObs:
     def __init__(self, policy):
@@ -250,3 +258,18 @@ class BootIndicator(BaseObs):
 
     def compute(self):
         return np.array([0.0], dtype=np.float32)
+
+
+class ComplianceFlagObs(BaseObs):
+    def __init__(self, policy):
+        self.policy = policy
+        self.force_threshold = getattr(self.policy, "compliance_flag_threshold", 0.0)
+        self.kp = self.force_threshold / 0.05
+        self.v = float(getattr(self.policy, "compliance_flag_value", 0.0))
+
+    @property
+    def size(self):
+        return 3
+
+    def compute(self):
+        return np.array([self.v, self.v * self.force_threshold, self.v * self.kp], dtype=np.float32)

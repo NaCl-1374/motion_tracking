@@ -3,11 +3,24 @@
 
 import torch
 import torch.distributions as D
-from isaaclab.utils.math import (
-    wrap_to_pi,
-    quat_conjugate,
-    quat_from_angle_axis,
-)
+
+
+def wrap_to_pi(x: torch.Tensor) -> torch.Tensor:
+    two_pi = 2 * torch.pi
+    return (x + torch.pi) % two_pi - torch.pi
+
+
+def quat_conjugate(q: torch.Tensor) -> torch.Tensor:
+    out = q.clone()
+    out[..., 1:] = -out[..., 1:]
+    return out
+
+
+def quat_from_angle_axis(angle: torch.Tensor, axis: torch.Tensor) -> torch.Tensor:
+    half = 0.5 * angle
+    w = torch.cos(half)
+    xyz = axis * torch.sin(half).unsqueeze(-1)
+    return torch.cat([w.unsqueeze(-1), xyz], dim=-1)
 
 def clamp_norm(x: torch.Tensor, min: float=0., max: float=torch.inf):
     x_norm = x.norm(dim=-1, keepdim=True).clamp(1e-6)

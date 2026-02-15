@@ -2,6 +2,8 @@ import torch
 import numpy as np
 import hydra
 import inspect
+import time
+from typing import NamedTuple, Dict, Optional
 
 from tensordict.tensordict import TensorDictBase, TensorDict
 from torchrl.envs import EnvBase
@@ -13,12 +15,67 @@ from torchrl.data import (
 from collections import OrderedDict
 
 from abc import abstractmethod
-from typing import NamedTuple, Dict
-import time
 
 import active_adaptation
 import active_adaptation.envs.mdp as mdp
 import active_adaptation.utils.symmetry as symmetry_utils
+
+class _NullDebugDraw:
+    def clear(self):
+        pass
+
+    def point(self, *args, **kwargs):
+        pass
+
+    def vector(self, *args, **kwargs):
+        pass
+
+
+class _ViserDebugDraw:
+    def __init__(self, scene):
+        self._scene = scene
+
+    def clear(self):
+        self._scene.clear()
+
+    def point(self, points, color=(1.0, 0.0, 0.0, 1.0), size: float = 5.0):
+        pts = self._to_numpy(points)
+        if pts.ndim == 1:
+            pts = pts[None, :]
+        radius = self._point_radius(size)
+        rgba = self._clamp_color(color)
+        for p in pts:
+            self._scene.add_sphere(p, radius=radius, color=rgba)
+
+    def vector(self, starts, vectors, color=(1.0, 0.0, 0.0, 1.0), width: float | None = None):
+        s = self._to_numpy(starts)
+        v = self._to_numpy(vectors)
+        if s.ndim == 1:
+            s = s[None, :]
+        if v.ndim == 1:
+            v = v[None, :]
+        if s.shape[0] != v.shape[0]:
+            raise ValueError("vector(): starts and vectors must have matching batch size.")
+        rgba = self._clamp_color(color)
+        arrow_width = width if width is not None else self._arrow_width()
+        for start, vec in zip(s, v):
+            end = start + vec
+            self._scene.add_arrow(start, end, color=rgba, width=arrow_width)
+
+    def _to_numpy(self, array):
+        if isinstance(array, torch.Tensor):
+            return array.detach().cpu().numpy()
+        return np.asarray(array)
+
+    def _clamp_color(self, color):
+        return tuple(float(max(0.0, min(1.0, c))) for c in color)
+
+    def _point_radius(self, size: float) -> float:
+        meansize = self._scene.meansize
+        return meansize * 0.001 * size
+
+    def _arrow_width(self) -> float:
+        return self._scene.meansize * 0.01
 
 class ObsGroup:
     
@@ -62,6 +119,7 @@ class ObsGroup:
         for obs_key, func in self.funcs.items():
             tensor = func()
             tensors.append(tensor)
+            # print(obs_key, tensor.shape)
         return torch.cat(tensors, dim=-1)
 
     def symmetry_transforms(self):
@@ -81,12 +139,11 @@ class ObsGroup:
         return transform
 
 class RewardGroup:
-    def __init__(self, env, name: str, funcs: OrderedDict[str, mdp.Reward], scale: list[float] | None = None, student_train: bool = False):
+    def __init__(self, env, name: str, funcs: OrderedDict[str, mdp.Reward], scale: list[float] | None = None):
         self.env = env
         self.name = name
         self.funcs = funcs
         self.scale = scale
-        self.student_train = student_train
         self.current_factor = 1.0
         self.enabled_rewards = sum([func.enabled for func in funcs.values()])
         self.rew_buf = torch.zeros(env.num_envs, self.enabled_rewards, device=env.device)
@@ -99,7 +156,7 @@ class RewardGroup:
             if self.scale[2] >= self.scale[3]:
                 raise ValueError(f"Scale[2] must be less than Scale[3], got {self.scale[2]} >= {self.scale[3]}")
             print(f"Reward group '{self.name}' is scaled with progress from {self.scale[0]} to {self.scale[1]} with factor from {self.scale[2]} to {self.scale[3]}")
-            self.step_schedule(0.0)  # Initialize current_factor based on scale
+            self.step_schedule(0.0, None)  # Initialize current_factor based on scale
     
     def compute(self) -> torch.Tensor:
         rewards = []
@@ -115,30 +172,32 @@ class RewardGroup:
             self.rew_buf[:] = torch.cat(rewards, 1)
         return self.rew_buf.sum(1, True) * self.current_factor
     
-    def step_schedule(self, progress: float):
-        if self.student_train:
+    def step_schedule(self, progress: float, iters: int | None = None):
+        if self.env.student_train:
             progress = 1.0
         if self.scale is not None:
             scaled = (progress - self.scale[0]) / (self.scale[1] - self.scale[0])
             scaled = min(max(scaled, 0.0), 1.0)
             self.current_factor = scaled * (self.scale[3] - self.scale[2]) + self.scale[2]
 
-from isaaclab.sim import SimulationContext
-from isaaclab.scene import InteractiveScene
-
 class _Env(EnvBase):
-    scene: InteractiveScene
-    sim: SimulationContext
+    scene: object
+    sim: object
     @torch.no_grad()
     def __init__(self, cfg):
         self.cfg = cfg
         active_adaptation._ENVS = cfg.num_envs
         self.backend = active_adaptation.get_backend()
+        self.device = f"cuda:{active_adaptation.get_local_rank()}"
+        self.viewer: Optional[object] = None
+        self.visualizer: Optional[object] = None
+        self.debug_draw = _NullDebugDraw()
         self.setup_scene()
+        self.setup_viewer()
         
         self.max_episode_length = self.cfg.max_episode_length
         self.step_dt = self.cfg.sim.step_dt
-        self.physics_dt = self.sim.get_physics_dt()
+        self.physics_dt = self.sim_cfg.mujoco.timestep
         self.decimation = int(self.step_dt / self.physics_dt)
         
         print(f"Step dt: {self.step_dt}, physics dt: {self.physics_dt}, decimation: {self.decimation}")
@@ -168,6 +227,8 @@ class _Env(EnvBase):
             },
             shape=[self.num_envs]
         ).to(self.device)
+
+        self.student_train = bool(self.cfg.student_train)
 
         members = dict(inspect.getmembers(self.__class__, inspect.isclass))
         self.command_manager: mdp.Command = hydra.utils.instantiate(self.cfg.command, env=self)
@@ -254,7 +315,6 @@ class _Env(EnvBase):
         # parse rewards
         self.clip_rewards = self.cfg.reward.pop("_clip_", True)
         self.mult_dt = self.cfg.reward.pop("_mult_dt_", True)
-        self.reward_student_train = self.cfg.reward.pop("_student_train_", False)
 
         self._stats_ema = {}
         self._stats_ema_decay = 0.99
@@ -278,7 +338,7 @@ class _Env(EnvBase):
                 print(f"\t{key}: \t{reward.weight:.2f}, \t{reward.enabled}")
                 self._stats_ema[group_name][key] = (torch.tensor(0., device=self.device), torch.tensor(0., device=self.device))
 
-            self.reward_groups[group_name] = RewardGroup(self, group_name, funcs, scale=scale_factor, student_train=self.reward_student_train)
+            self.reward_groups[group_name] = RewardGroup(self, group_name, funcs, scale=scale_factor)
             reward_spec["stats", group_name, "return"] = UnboundedContinuous(1, device=self.device)
 
         reward_spec["reward"] = UnboundedContinuous(max(1, len(self.reward_groups)), device=self.device)
@@ -345,14 +405,11 @@ class _Env(EnvBase):
         env_ids = env_mask.nonzero().squeeze(-1)
 
         # reset things in simulation
-        if len(env_ids):
+        if env_ids.numel() > 0:
+            # reset things in simulation
             self._reset_idx(env_ids)
-
-        # reset episode length buffer
-        if env_ids.numel() < self.num_envs * 0.2:
-            self.episode_length_buf[env_ids] = torch.randint(0, self.max_episode_length // 5, (env_ids.numel(),), device=self.device)
-        else:
-            self.episode_length_buf[env_ids] = torch.randint(0, self.max_episode_length, (env_ids.numel(),), device=self.device)
+            # reset episode length buffer
+            self.episode_length_buf[env_ids] = torch.randint(0, self.max_episode_length // 10, (env_ids.numel(),), device=self.device)
 
         # reset mdp
         for callback in self._reset_callbacks:
@@ -412,19 +469,11 @@ class _Env(EnvBase):
     def _update(self):
         for callback in self._update_callbacks:
             callback()
-        if self.sim.has_gui():
-            self.sim.render()
         self.episode_length_buf.add_(1)
         self.timestamp += 1
 
     def _update_sim(self, tensordict: TensorDictBase):
         for substep in range(self.decimation):
-            for asset in self.scene.articulations.values():
-                if asset.has_external_wrench:
-                    asset._external_force_b.zero_()
-                    asset._external_torque_b.zero_()
-                    asset.has_external_wrench = False
-
             # take actions
             self.apply_action(tensordict, substep)
 
@@ -432,25 +481,10 @@ class _Env(EnvBase):
             for callback in self._pre_step_callbacks:
                 callback(substep)
 
-            # deal with custom force apply logic
-            if hasattr(self.command_manager, "force_apply_world") and self.command_manager.force_apply_world:
-                asset = self.command_manager.asset
-                force = self.command_manager.force_apply_buffer
-                torque = self.command_manager.torque_apply_buffer if hasattr(self.command_manager, "torque_apply_buffer") else None
-                position = self.command_manager.position_apply_buffer if hasattr(self.command_manager, "position_apply_buffer") else None
-                physx = asset.root_physx_view
-                physx.apply_forces_and_torques_at_position(
-                    force_data=force,
-                    torque_data=torque,
-                    position_data=position,
-                    indices=asset._ALL_INDICES,
-                    is_global=True,
-                )
-
             self.scene.write_data_to_sim()
 
             # run simulation
-            self.sim.step(render=False)
+            self.sim.step()
 
             # update buffer
             self.scene.update(self.physics_dt)
@@ -494,36 +528,87 @@ class _Env(EnvBase):
         tensordict.set("discount", self.discount.clone())
         tensordict["stats"] = self.stats.clone()
 
-        if self.sim.has_gui():
-            if hasattr(self, "debug_draw"): # isaac only
+        if self._has_gui():
+            if hasattr(self, "debug_draw"):
                 self.debug_draw.clear()
             for callback in self._debug_draw_callbacks:
                 callback()
             self.debug_vis()
+        self._update_viewer()
             
         return tensordict
     
     def _set_seed(self, seed: int = -1):
-        # import omni.replicator.core as rep
-        # rep.set_global_seed(seed)
         torch.manual_seed(seed)
 
     def render(self, mode: str = "human"):
-        self.sim.render()
         if mode == "human":
+            self._update_viewer(force_sync=True)
+            breakpoint()
             return None
-        elif mode == "rgb_array":
-            # obtain the rgb data
-            rgb_data = self._rgb_annotator.get_data()
-            # convert to numpy array
-            rgb_data = np.frombuffer(rgb_data, dtype=np.uint8).reshape(*rgb_data.shape)
-            # return the rgb data
-            return rgb_data[:, :, :3]
-        else:
-            raise NotImplementedError
+        raise NotImplementedError
     
     def debug_vis(self):
         pass
+
+    def setup_viewer(self) -> None:
+        self._viewer_enabled = False
+        self.viewer = None
+
+        headless = True
+        if hasattr(self.cfg, "viewer"):
+            headless = self.cfg.viewer.get("headless", True)
+        if headless:
+            print("[INFO] Headless mode: not launching viewer.")
+            return
+
+        try:
+            import viser
+            from mjlab.viewer.viser.scene import ViserMujocoScene
+        except Exception as exc:
+            print(f"[WARN] Viser viewer not available ({exc}).")
+            return
+
+        try:
+            self.viewer = viser.ViserServer(label="gmt")
+            self._viser_scene = ViserMujocoScene.create(
+                server=self.viewer,
+                mj_model=self.sim.mj_model,
+                num_envs=self.num_envs,
+            )
+            self._viser_scene.create_visualization_gui()
+            self._viser_scene.debug_visualization_enabled = True
+            self._viewer_enabled = True
+            self.debug_draw = _ViserDebugDraw(self._viser_scene)
+            print("[INFO] Viser viewer launched.")
+        except Exception as exc:
+            print(f"[WARN] Failed to launch Viser viewer: {exc}")
+
+    def _update_viewer(self, force_sync: bool = False) -> None:
+        if not self._viewer_enabled or self.viewer is None:
+            return
+        if not hasattr(self.sim, "data"):
+            return
+        wp_data = self.sim.data
+        try:
+            device = getattr(wp_data.xpos, "device", None)
+            if device is not None and device.type != "cpu":
+                from types import SimpleNamespace
+
+                wp_data = SimpleNamespace(
+                    xpos=wp_data.xpos.detach().cpu(),
+                    xmat=wp_data.xmat.detach().cpu(),
+                    mocap_pos=wp_data.mocap_pos.detach().cpu(),
+                    mocap_quat=wp_data.mocap_quat.detach().cpu(),
+                    qpos=wp_data.qpos.detach().cpu(),
+                    qvel=wp_data.qvel.detach().cpu(),
+                )
+        except Exception:
+            pass
+        self._viser_scene.update(wp_data)
+
+    def _has_gui(self) -> bool:
+        return self._viewer_enabled and self.viewer is not None
     
 
     def state_dict(self):
@@ -538,21 +623,20 @@ class _Env(EnvBase):
 
     def close(self):
         if not self.is_closed:
-            if self.backend == "isaac":
-                # destructor is order-sensitive
-                del self.scene
-                # clear callbacks and instance
-                self.sim.clear_all_callbacks()
-                self.sim.clear_instance()
-                # update closing status
+            if self.viewer is not None:
+                try:
+                    self.viewer.stop()
+                except Exception:
+                    pass
+                self.viewer = None
+            self._viewer_enabled = False
             super().close()
             
-    def step_schedule(self, progress: float, iter: int):
+    def step_schedule(self, progress: float, iters: int):
         if hasattr(self.command_manager, "step_schedule"):
-            if inspect.signature(self.command_manager.step_schedule).parameters.get("iter"):
-                self.command_manager.step_schedule(progress, iter)
-            else:
-                self.command_manager.step_schedule(progress)
+            self.command_manager.step_schedule(progress, iters)
+        if hasattr(self.action_manager, "step_schedule"):
+            self.action_manager.step_schedule(progress, iters)
         for rew in self.reward_groups.values():
             if hasattr(rew, "step_schedule"):
-                rew.step_schedule(progress)
+                rew.step_schedule(progress, iters)

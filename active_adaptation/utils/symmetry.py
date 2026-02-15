@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Sequence, TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from isaaclab.assets import Articulation
+    from mjlab.entity import Entity as Articulation
 
 
 class SymmetryTransform(nn.Module):

@@ -4,8 +4,10 @@ import abc
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from isaaclab.assets import Articulation
-    from isaaclab.sensors import ContactSensor
+    from mjlab.entity import Entity as Articulation
+    from mjlab.sensor import ContactSensor
+
+from active_adaptation.envs.mdp.contact_utils import resolve_contact_indices
 
 
 class Termination:
@@ -51,9 +53,12 @@ class crash(Termination):
         **kwargs
     ):
         super().__init__(env)
+        raise NotImplementedError("Not implemented for MJLab backend.")
         self.asset: Articulation = self.env.scene["robot"]
         self.contact_sensor: ContactSensor = self.env.scene["contact_forces"]
-        self.body_indices, self.body_names = self.contact_sensor.find_bodies(body_names_expr)
+        self.body_indices, self.body_names = resolve_contact_indices(
+            self.contact_sensor, self.asset, body_names_expr
+        )
         self.t_thres = t_thres
         self._decay = 0.98
         self._thres = (self.t_thres / self.env.physics_dt) * 0.9
@@ -65,7 +70,10 @@ class crash(Termination):
         self.count[env_ids] = 0.
     
     def update(self):
-        in_contact = self.contact_sensor.data.net_forces_w[:, self.body_indices].norm(dim=-1) > 1.0
+        data = self.contact_sensor.data
+        if getattr(data, "force", None) is None:
+            raise RuntimeError("Contact sensor does not provide force data.")
+        in_contact = data.force[:, self.body_indices].norm(dim=-1) > 1.0
         self.count.add_(in_contact.float()).mul_(self._decay)
         
     def __call__(self):

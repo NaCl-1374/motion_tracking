@@ -3,13 +3,11 @@ import numpy as np
 import logging
 from typing import Union, TYPE_CHECKING, Dict, Tuple
 
-import active_adaptation
-
-import isaaclab.utils.string as string_utils
+import mjlab.utils.lab_api.string as string_utils
 
 
 if TYPE_CHECKING:
-    from isaaclab.assets import Articulation
+    from mjlab.entity import Entity as Articulation
     from active_adaptation.envs.base import _Env
 
 
@@ -59,41 +57,49 @@ class motor_params_implicit(Randomization):
         self.stiffness_range = dict(stiffness_range)
         self.damping_range   = dict(damping_range)
         self.armature_range  = dict(armature_range)
-        # ------- stiffness -------
-        ids, _, val = string_utils.resolve_matching_names_values(
-            self.stiffness_range, self.asset.joint_names
+        self.model = self.env.sim.model
+        # ------- stiffness / damping via actuator gains (mjlab randomize_pd_gains style) -------
+        kp_ids, _, kp_ranges = string_utils.resolve_matching_names_values(
+            self.stiffness_range, self.asset.actuator_names
         )
-        self.stiffness_id  = torch.tensor(ids, device=self.device, dtype=torch.long)
-        self.stiffness_def = self.asset.data.joint_stiffness[0, self.stiffness_id]
-        low, high          = (
-            torch.tensor(val, device=self.device) * self.stiffness_def.unsqueeze(1)
-        ).unbind(1)
-        self.stiffness_low   = low
-        self.stiffness_scale = high - low
+        kd_ids, _, kd_ranges = string_utils.resolve_matching_names_values(
+            self.damping_range, self.asset.actuator_names
+        )
 
-        # ------- damping -------
-        ids, _, val = string_utils.resolve_matching_names_values(
-            self.damping_range, self.asset.joint_names
-        )
-        self.damping_id  = torch.tensor(ids, device=self.device, dtype=torch.long)
-        self.damping_def = self.asset.data.joint_damping[0, self.damping_id]
-        low, high        = (
-            torch.tensor(val, device=self.device) * self.damping_def.unsqueeze(1)
-        ).unbind(1)
-        self.damping_low   = low
-        self.damping_scale = high - low
+        self.kp_ctrl_ids = self.asset.indexing.ctrl_ids[
+            torch.tensor(kp_ids, device=self.device, dtype=torch.long)
+        ]
+        self.kd_ctrl_ids = self.asset.indexing.ctrl_ids[
+            torch.tensor(kd_ids, device=self.device, dtype=torch.long)
+        ]
+
+        default_gainprm = self.env.sim.get_default_field("actuator_gainprm")
+        default_biasprm = self.env.sim.get_default_field("actuator_biasprm")
+
+        self.kp_gain_def = default_gainprm[self.kp_ctrl_ids, 0]
+        self.kp_bias_def = default_biasprm[self.kp_ctrl_ids, 1]
+        self.kd_bias_def = default_biasprm[self.kd_ctrl_ids, 2]
+
+        kp_low, kp_high = torch.tensor(kp_ranges, device=self.device).unbind(1)
+        kd_low, kd_high = torch.tensor(kd_ranges, device=self.device).unbind(1)
+
+        self.kp_low = kp_low
+        self.kp_scale = kp_high - kp_low
+        self.kd_low = kd_low
+        self.kd_scale = kd_high - kd_low
 
         # ------- armature (改为相对值) -------
-        ids, _, val = string_utils.resolve_matching_names_values(
+        arm_ids, _, arm_ranges = string_utils.resolve_matching_names_values(
             self.armature_range, self.asset.joint_names
         )
-        self.armature_id  = torch.tensor(ids, device=self.device, dtype=torch.long)
-        self.armature_def = self.asset.data.joint_armature[0, self.armature_id]
-        low, high         = (
-            torch.tensor(val, device=self.device) * self.armature_def.unsqueeze(1)
-        ).unbind(1)
-        self.armature_low   = low
-        self.armature_scale = high - low
+        self.arm_ids = torch.tensor(arm_ids, device=self.device, dtype=torch.long)
+        self.arm_dof_ids = self.asset.indexing.joint_v_adr[self.arm_ids]
+        default_armature = self.env.sim.get_default_field("dof_armature")
+        self.arm_def = default_armature[self.arm_dof_ids]
+
+        arm_low, arm_high = torch.tensor(arm_ranges, device=self.device).unbind(1)
+        self.arm_low = arm_low
+        self.arm_scale = arm_high - arm_low
 
     def _rand_u(self, n_env: int, k: int):
         return torch.rand(n_env, k, device=self.device)
@@ -102,20 +108,29 @@ class motor_params_implicit(Randomization):
     def reset(self, env_ids):
         n_env = len(env_ids)
 
-        # stiffness
-        stiff = self._rand_u(n_env, len(self.stiffness_id))
-        stiff = stiff * self.stiffness_scale + self.stiffness_low
-        self.asset.write_joint_stiffness_to_sim(stiff, self.stiffness_id, env_ids)
+        # stiffness (kp)
+        kp_samples = self._rand_u(n_env, len(self.kp_ctrl_ids))
+        kp_samples = kp_samples * self.kp_scale + self.kp_low
+        self.model.actuator_gainprm[env_ids[:, None], self.kp_ctrl_ids[None, :], 0] = (
+            self.kp_gain_def * kp_samples
+        )
+        self.model.actuator_biasprm[env_ids[:, None], self.kp_ctrl_ids[None, :], 1] = (
+            self.kp_bias_def * kp_samples
+        )
 
-        # damping
-        damp = self._rand_u(n_env, len(self.damping_id))
-        damp = damp * self.damping_scale + self.damping_low
-        self.asset.write_joint_damping_to_sim(damp, self.damping_id, env_ids)
+        # damping (kd)
+        kd_samples = self._rand_u(n_env, len(self.kd_ctrl_ids))
+        kd_samples = kd_samples * self.kd_scale + self.kd_low
+        self.model.actuator_biasprm[env_ids[:, None], self.kd_ctrl_ids[None, :], 2] = (
+            self.kd_bias_def * kd_samples
+        )
 
         # armature
-        arma = self._rand_u(n_env, len(self.armature_id))
-        arma = arma * self.armature_scale + self.armature_low
-        self.asset.write_joint_armature_to_sim(arma, self.armature_id, env_ids)
+        arma = self._rand_u(n_env, len(self.arm_ids))
+        arma = arma * self.arm_scale + self.arm_low
+        self.model.dof_armature[env_ids[:, None], self.arm_dof_ids[None, :]] = (
+            self.arm_def * arma
+        )
 
 
 class perturb_body_materials(Randomization):
@@ -124,67 +139,79 @@ class perturb_body_materials(Randomization):
         env,
         body_names,
         static_friction_range=(0.6, 1.0),
-        dynamic_friction_frac_range=(0.6, 1.0),
-        restitution_range=(0.0, 0.2),
+        solref_time_constant_range=(0.02, 0.02),
+        solref_dampratio_range=(1.0, 1.0),
         homogeneous: bool = False,
-        num_buckets: int = 16,
     ):
         super().__init__(env)
         self.asset: Articulation = self.env.scene["robot"]
         self.body_ids, self.body_names = self.asset.find_bodies(body_names)
 
         self.static_friction_range = static_friction_range
-        self.dynamic_friction_frac_range = dynamic_friction_frac_range
-        self.restitution_range = restitution_range
+        self.solref_time_constant_range = solref_time_constant_range
+        self.solref_dampratio_range = solref_dampratio_range
         self.homogeneous = homogeneous
-        self.num_buckets = num_buckets
 
-        self.default_materials = (
-            self.asset.root_physx_view.get_material_properties()
+        if len(self.body_ids) == 0:
+            raise ValueError(
+                "No bodies matched the provided names for material perturbation."
+            )
+
+        local_body_ids = torch.as_tensor(
+            self.body_ids, device=self.device, dtype=torch.long
         )
-        num_shapes_per_body = []
-        for link_path in self.asset.root_physx_view.link_paths[0]:
-            link_physx_view = self.asset._physics_sim_view.create_rigid_body_view(link_path)  # type: ignore
-            num_shapes_per_body.append(link_physx_view.max_shapes)
-        cumsum = np.cumsum([0] + num_shapes_per_body)
-        self.shape_ids = torch.cat(
-            [torch.arange(cumsum[i], cumsum[i + 1]) for i in self.body_ids]
+        self.global_body_ids = self.asset.indexing.body_ids[local_body_ids]
+        selected_body_set = set(self.global_body_ids.cpu().tolist())
+
+        geom_global_ids = self.asset.indexing.geom_ids.cpu().tolist()
+        geom_names = self.asset.geom_names
+        selected_geom_local: list[int] = []
+        selected_geom_global: list[int] = []
+        selected_geom_names: list[str] = []
+
+        cpu_model = self.env.sim.mj_model
+        for local_idx, global_idx in enumerate(geom_global_ids):
+            body_id = int(cpu_model.geom_bodyid[global_idx])
+            if body_id in selected_body_set:
+                selected_geom_local.append(local_idx)
+                selected_geom_global.append(global_idx)
+                selected_geom_names.append(geom_names[local_idx])
+
+        if not selected_geom_global:
+            raise ValueError(
+                "No geoms found for the specified bodies when configuring material perturbation."
+            )
+
+        self.geom_local_ids = torch.as_tensor(
+            selected_geom_local, device=self.device, dtype=torch.long
         )
+        self.geom_global_ids = torch.as_tensor(
+            selected_geom_global, device=self.device, dtype=torch.long
+        )
+        self.geom_names = selected_geom_names
 
     def startup(self):
-        logging.info(f"Randomize body materials of {self.body_names} upon startup.")
+        logging.info(f"Randomize body materials of {self.geom_names} upon startup.")
 
-        materials = self.default_materials.clone()
-        if self.homogeneous:
-            shape = (self.num_envs, 1)
-        else:
-            shape = (self.num_envs, len(self.shape_ids))
+        num_geoms = self.geom_global_ids.numel()
+        sample_cols = 1 if self.homogeneous else num_geoms
+        shape = (self.num_envs, sample_cols)
 
-        sf  = sample_uniform(shape, *self.static_friction_range)                      # static friction
-        dff = sample_uniform(shape, *self.dynamic_friction_frac_range)                # dynamic-fraction
-        res = sample_uniform(shape, *self.restitution_range)                          # restitution
+        sf = sample_uniform(shape, *self.static_friction_range, device=self.device)
+        tc = sample_uniform(shape, *self.solref_time_constant_range, device=self.device)
+        dr = sample_log_uniform(shape, *self.solref_dampratio_range, device=self.device)
 
-        def _bucketize(x, lo, hi, n):
-            step = (hi - lo) / (n - 1)
-            idx  = ((x - lo) / step).round().clamp(0, n - 1)
-            return lo + idx * step
+        if sample_cols == 1:
+            sf = sf.expand(-1, num_geoms)
+            tc = tc.expand(-1, num_geoms)
+            dr = dr.expand(-1, num_geoms)
 
-        N = self.num_buckets                       # 16 ⇒ 4096 种组合上限
-        sf  = _bucketize(sf,  *self.static_friction_range,           N)
-        dff = _bucketize(dff, *self.dynamic_friction_frac_range,     N)
-        res = _bucketize(res, *self.restitution_range,               N)
-        # -------------------------------------------------------------
+        model = self.env.sim.model
+        geom_friction = model.geom_friction
+        geom_friction[:, self.geom_global_ids, 0] = sf
+        model.geom_solref[:, self.geom_global_ids, 0] = tc
+        model.geom_solref[:, self.geom_global_ids, 1] = dr
 
-        materials[:, self.shape_ids, 0] = sf
-        materials[:, self.shape_ids, 1] = dff * sf
-        materials[:, self.shape_ids, 2] = res
-
-        indices = torch.arange(self.asset.num_instances)
-
-        self.asset.root_physx_view.set_material_properties(
-            materials.flatten(), indices
-        )
-        self.asset.data.body_materials = materials.to(self.device)
 
 class perturb_body_mass(Randomization):
     def __init__(
@@ -192,42 +219,68 @@ class perturb_body_mass(Randomization):
     ):
         super().__init__(env)
         self.asset: Articulation = self.env.scene["robot"]
+        if not perturb_ranges:
+            raise ValueError("perturb_body_mass requires at least one body range entry.")
 
-        self.body_ids, self.body_names, values = string_utils.resolve_matching_names_values(
+        body_ids, body_names, values = string_utils.resolve_matching_names_values(
             perturb_ranges, self.asset.body_names
         )
-        self.mass_ranges = torch.tensor(values)
-        print(self.body_names)
+        if len(body_ids) == 0:
+            raise ValueError(
+                "No bodies matched the provided patterns for mass perturbation."
+            )
+
+        self.body_names = body_names
+        self.local_body_ids = torch.as_tensor(body_ids, device=self.device, dtype=torch.long)
+        self.global_body_ids = self.asset.indexing.body_ids[self.local_body_ids]
+        self.mass_ranges = torch.as_tensor(values, device=self.device, dtype=torch.float32)
+
+        model = self.env.sim.model
+        self._default_mass = model.body_mass[:, self.global_body_ids].clone()
+        self._default_inertia = model.body_inertia[:, self.global_body_ids].clone()
+
 
     def startup(self):
         logging.info(f"Randomize body masses of {self.body_names} upon startup.")
-        masses = self.asset.data.default_mass.clone()
-        inertias = self.asset.data.default_inertia.clone()
-        print(f"Default masses: {masses[0]}")
-        scale = uniform(
-            self.mass_ranges[:, 0].expand_as(masses[:, self.body_ids]),
-            self.mass_ranges[:, 1].expand_as(masses[:, self.body_ids])
+        low = self.mass_ranges[:, 0]
+        high = self.mass_ranges[:, 1]
+        rand = torch.rand(
+            self.num_envs, self.local_body_ids.numel(), device=self.device
         )
-        masses[:, self.body_ids] *= scale
-        inertias[:, self.body_ids] *= scale.unsqueeze(-1)
-        indices = torch.arange(self.asset.num_instances)
-        self.asset.root_physx_view.set_masses(masses, indices)
-        self.asset.root_physx_view.set_inertias(inertias, indices)
-        assert torch.allclose(self.asset.root_physx_view.get_masses(), masses)
+        scale = low + (high - low) * rand
+
+        model = self.env.sim.model
+        new_mass = self._default_mass * scale
+        new_inertia = self._default_inertia * scale.unsqueeze(-1)
+        model.body_mass[:, self.global_body_ids] = new_mass
+        model.body_inertia[:, self.global_body_ids] = new_inertia
+
 
 class perturb_body_com(Randomization):
     def __init__(self, env, body_names = ".*", com_range=(-0.05, 0.05)):
         super().__init__(env)
         self.asset: Articulation = self.env.scene["robot"]
-        self.com_range = com_range
         self.body_ids, self.body_names = self.asset.find_bodies(body_names)
-        self.ALL_INDICES = torch.arange(self.asset.num_instances)
+        if len(self.body_ids) == 0:
+            raise ValueError("No bodies matched the provided names for COM perturbation.")
+
+        self.com_range = tuple(com_range)
+        self.local_body_ids = torch.as_tensor(self.body_ids, device=self.device, dtype=torch.long)
+        self.global_body_ids = self.asset.indexing.body_ids[self.local_body_ids]
+
+        model = self.env.sim.model
+        self._default_body_ipos = model.body_ipos[:, self.global_body_ids].clone()
     
     def startup(self):
-        coms = self.asset.root_physx_view.get_coms()
-        rand_offset = sample_uniform((self.asset.num_instances, len(self.body_ids), 3), *self.com_range)
-        coms[:, self.body_ids, :3] += rand_offset
-        self.asset.root_physx_view.set_coms(coms, indices=self.ALL_INDICES)
+        num_bodies = self.global_body_ids.numel()
+        low, high = self.com_range
+        offsets = torch.rand(self.num_envs, num_bodies, 3, device=self.device)
+        offsets = low + (high - low) * offsets
+
+        model = self.env.sim.model
+        new_ipos = self._default_body_ipos + offsets
+        model.body_ipos[:, self.global_body_ids] = new_ipos
+
 
 class random_joint_offset(Randomization):
     def __init__(self, env, **offset_range: Tuple[float, float]):
@@ -263,6 +316,13 @@ def random_shift(x: torch.Tensor, low: float, high: float):
 
 def sample_uniform(size, low: float, high: float, device: torch.device = "cpu"):
     return torch.rand(size, device=device) * (high - low) + low
+
+def sample_log_uniform(size, low: float, high: float, device: torch.device = "cpu"):
+    low_t = torch.tensor(low, device=device, dtype=torch.float32)
+    high_t = torch.tensor(high, device=device, dtype=torch.float32)
+    return log_uniform(low_t, high_t).expand(size) if size == () else log_uniform(
+        low_t.expand(size), high_t.expand(size)
+    )
 
 def uniform(low: torch.Tensor, high: torch.Tensor):
     r = torch.rand_like(low)

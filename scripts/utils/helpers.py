@@ -100,10 +100,67 @@ from torchrl.envs.transforms.transforms import _sum_left
 
 import active_adaptation as aa
 
+
+class SymmetricVecNorm(VecNorm):
+    """VecNorm that updates running stats with both sample and mirrored sample."""
+
+    def __init__(self, *args, symmetry_transforms=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._symmetry_transforms = symmetry_transforms or {}
+
+    def _get_symmetry(self, key):
+        transform = self._symmetry_transforms.get(key)
+        if transform is None and isinstance(key, tuple):
+            transform = self._symmetry_transforms.get(key[-1])
+        return transform
+
+    def _update(self, key, value, N) -> torch.Tensor:
+        _sum = self._td.get(_append_last(key, "_sum"))
+        _ssq = self._td.get(_append_last(key, "_ssq"))
+        _count = self._td.get(_append_last(key, "_count"))
+
+        value_sum = _sum_left(value, _sum)
+        value_ssq = _sum_left(value.pow(2), _ssq)
+        count_update = N
+
+        symmetry = self._get_symmetry(key)
+        if symmetry is not None:
+            if symmetry.perm.numel() != value.shape[-1]:
+                raise RuntimeError(
+                    f"Symmetry dim mismatch for key '{key}': "
+                    f"perm={symmetry.perm.numel()} vs value={value.shape[-1]}"
+                )
+            value_sum = value_sum + symmetry(value_sum, sign=True)
+            value_ssq = value_ssq + symmetry(value_ssq, sign=False)
+            count_update = 2 * N
+
+        if not self.frozen:
+            _sum *= self.decay
+            _sum += value_sum
+            self._td.set_(_append_last(key, "_sum"), _sum)
+
+            _ssq *= self.decay
+            _ssq += value_ssq
+            self._td.set_(_append_last(key, "_ssq"), _ssq)
+
+            _count *= self.decay
+            _count += count_update
+            self._td.set_(_append_last(key, "_count"), _count)
+
+        mean = _sum / _count
+        std = (_ssq / _count - mean.pow(2)).clamp_min(self.eps).sqrt()
+        return (value - mean) / std.clamp_min(self.eps)
+
+
 def make_env_policy(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
     from active_adaptation.envs import SimpleEnv
-    from torchrl.envs.transforms import TransformedEnv, Compose, InitTracker, VecNorm, StepCounter
+    from torchrl.envs.transforms import TransformedEnv, Compose, InitTracker, StepCounter
+    # Propagate top-level/app headless flag into task.viewer for MJLab GUI.
+    if "app" in cfg and "headless" in cfg.app:
+        cfg.task.viewer.headless = cfg.app.headless
+    elif "headless" in cfg:
+        cfg.task.viewer.headless = cfg.headless
     aa.print("import SimpleEnv done")
     base_env = SimpleEnv(cfg.task)
     aa.print("SimpleEnv done")
@@ -138,7 +195,29 @@ def make_env_policy(cfg: DictConfig):
 
     assert cfg.vecnorm in ("train", "eval", None)
     print(colored(f"[Info]: create VecNorm for keys: {obs_keys}", "green"))
-    vecnorm = VecNorm(obs_keys, decay=0.9999)
+    symmetry_enabled = bool(cfg.algo.get("symmetry_enabled", True))
+    use_symmetry_vecnorm = symmetry_enabled
+
+    if use_symmetry_vecnorm:
+        vecnorm_symmetry = {}
+        for key in obs_keys:
+            obs_key = key[-1] if isinstance(key, tuple) else key
+            if obs_key not in base_env.observation_funcs:
+                continue
+            try:
+                vecnorm_symmetry[key] = base_env.observation_funcs[obs_key].symmetry_transforms().to(base_env.device)
+            except NotImplementedError:
+                print(colored(f"[Warn]: Obs group '{obs_key}' has no symmetry_transforms(); VecNorm keeps default update.", "yellow"))
+        if len(vecnorm_symmetry):
+            print(colored(f"[Info]: enable symmetric VecNorm for keys: {sorted(map(str, vecnorm_symmetry.keys()))}", "green"))
+        vecnorm = SymmetricVecNorm(
+            obs_keys,
+            decay=0.9999,
+            symmetry_transforms=vecnorm_symmetry,
+        )
+    else:
+        print(colored("[Info]: symmetry VecNorm disabled by cfg.", "yellow"))
+        vecnorm = VecNorm(obs_keys, decay=0.9999)
     vecnorm(base_env.fake_tensordict())
 
     if "vecnorm" in state_dict.keys():

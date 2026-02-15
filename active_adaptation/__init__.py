@@ -1,7 +1,7 @@
 import os
 from active_adaptation.learning import ALGOS
 
-_BACKEND = "isaac"
+_BACKEND = "mjlab"
 
 _LOCAL_RANK = os.getenv("LOCAL_RANK", "0")
 _LOCAL_RANK = int(_LOCAL_RANK)
@@ -32,8 +32,8 @@ def print(*args, **kwargs):
 ASSET_PATH = os.path.join(os.path.dirname(__file__), "assets")
 
 def set_backend(backend: str):
-    if backend not in ("isaac",):
-        raise NotImplementedError(f"Unsupported backend: {backend}")
+    if backend != "mjlab":
+        raise ValueError(f"backend must be 'mjlab', got {backend}")
     global _BACKEND
     _BACKEND = backend
 

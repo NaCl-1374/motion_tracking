@@ -16,10 +16,8 @@ algo:
   load_noise_scale: null
 
 task:
-  command:
-    student_train: False
+  student_train: false
   reward:
-    _student_train_: false
     loco:
       _scale_factor_: [0.0, 1.0, 0.5, 1.0]
       joint_acc_l2:       {weight: 2.0e-8, enabled: true, joint_names: .*}

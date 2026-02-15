@@ -71,6 +71,7 @@ class PPOConfig:
     # phase switch
     phase: str = "train"  # train | finetune | adapt
     vecnorm: Union[str, None] = None
+    symmetry_enabled: bool = True
 
     # I/O keys
     in_keys: List[str] = field(
@@ -240,15 +241,18 @@ class PPOPolicy(TensorDictModuleBase):
         )
         self.update2 = functools.partial(self._update2, adapt_module=self.adapt_module, opt_estimator=self.opt_estimator)
 
-        self.obs_transform = env.observation_funcs[OBS_KEY].symmetry_transforms()
-        self.obs_priv_transform = env.observation_funcs[OBS_PRIV_KEY].symmetry_transforms()
-        self.critic_priv_transform = env.observation_funcs[CRITIC_PRIV_KEY].symmetry_transforms()
-        self.act_transform = env.action_manager.symmetry_transforms()
-
-        self.obs_transform = self.obs_transform.to(self.device)
-        self.obs_priv_transform = self.obs_priv_transform.to(self.device)
-        self.critic_priv_transform = self.critic_priv_transform.to(self.device)
-        self.act_transform = self.act_transform.to(self.device)
+        self.use_symmetry_ppo = bool(getattr(self.cfg, "symmetry_enabled", True))
+        aa.print(f"use_symmetry_ppo={self.use_symmetry_ppo}")
+        if self.use_symmetry_ppo:
+            self.obs_transform = env.observation_funcs[OBS_KEY].symmetry_transforms().to(self.device)
+            self.obs_priv_transform = env.observation_funcs[OBS_PRIV_KEY].symmetry_transforms().to(self.device)
+            self.critic_priv_transform = env.observation_funcs[CRITIC_PRIV_KEY].symmetry_transforms().to(self.device)
+            self.act_transform = env.action_manager.symmetry_transforms().to(self.device)
+        else:
+            self.obs_transform = None
+            self.obs_priv_transform = None
+            self.critic_priv_transform = None
+            self.act_transform = None
 
     def _wrap_ddp(self, local_rank: int):
         ddp_kwargs = dict(device_ids=[local_rank], output_device=local_rank,
@@ -396,17 +400,20 @@ class PPOPolicy(TensorDictModuleBase):
         action_old = mb["action"].clone()
         logp_old = mb["sample_log_prob"].clone()
 
-        mb_sym = mb.clone()
-        mb_sym[OBS_KEY] = self.obs_transform(mb_sym[OBS_KEY])
-        mb_sym[OBS_PRIV_KEY] = self.obs_priv_transform(mb_sym[OBS_PRIV_KEY])
-        mb_sym[CRITIC_PRIV_KEY] = self.critic_priv_transform(mb_sym[CRITIC_PRIV_KEY])
-        mb_sym["adv"] = mb["adv"]
-        mb_sym["ret"] = mb["ret"]
-        mb_sym["is_init"] = mb["is_init"]
+        if self.use_symmetry_ppo:
+            mb_sym = mb.clone()
+            mb_sym[OBS_KEY] = self.obs_transform(mb_sym[OBS_KEY])
+            mb_sym[OBS_PRIV_KEY] = self.obs_priv_transform(mb_sym[OBS_PRIV_KEY])
+            mb_sym[CRITIC_PRIV_KEY] = self.critic_priv_transform(mb_sym[CRITIC_PRIV_KEY])
+            mb_sym["adv"] = mb["adv"]
+            mb_sym["ret"] = mb["ret"]
+            mb_sym["is_init"] = mb["is_init"]
 
-        mb_sym = mb_sym.exclude("next")
-        mb = mb.exclude("next")
-        mb = torch.cat([mb, mb_sym], dim=0)
+            mb_sym = mb_sym.exclude("next")
+            mb = mb.exclude("next")
+            mb = torch.cat([mb, mb_sym], dim=0)
+        else:
+            mb = mb.exclude("next")
         valid = ~mb["is_init"]
         mb = mb.exclude("sample_log_prob", "action")
 
@@ -446,8 +453,15 @@ class PPOPolicy(TensorDictModuleBase):
         else:
             reg_loss = 0.0
         
-        symmetry_loss_loc = F.mse_loss(mb["loc"][:bsize], self.act_transform(mb["loc"][bsize:])) * 0.2
-        symmetry_loss_std = F.mse_loss(mb["scale"][:bsize], self.act_transform(mb["scale"][bsize:], sign=False)) * 10
+        if self.use_symmetry_ppo:
+            symmetry_loss_loc = F.mse_loss(mb["loc"][:bsize], self.act_transform(mb["loc"][bsize:])) * 0.2
+            symmetry_loss_std = F.mse_loss(
+                mb["scale"][:bsize],
+                self.act_transform(mb["scale"][bsize:], sign=False),
+            ) * 10
+        else:
+            symmetry_loss_loc = torch.zeros((), device=self.device)
+            symmetry_loss_std = torch.zeros((), device=self.device)
 
         loss = policy_loss + entropy_loss + value_loss.mean() + reg_loss + symmetry_loss_loc + symmetry_loss_std
 
@@ -523,15 +537,18 @@ class PPOPolicy(TensorDictModuleBase):
         return {k: v.mean().item() for k, v in torch.stack(infos).items()}
 
     def _update2(self, mb, adapt_module, opt_estimator):
-        mb_sym = mb.clone()
-        mb_sym[OBS_KEY] = self.obs_transform(mb_sym[OBS_KEY])
-        mb_sym[OBS_PRIV_KEY] = self.obs_priv_transform(mb_sym[OBS_PRIV_KEY])
-        mb_sym[CRITIC_PRIV_KEY] = self.critic_priv_transform(mb_sym[CRITIC_PRIV_KEY])
-        mb_sym["is_init"] = mb["is_init"]
+        if self.use_symmetry_ppo:
+            mb_sym = mb.clone()
+            mb_sym[OBS_KEY] = self.obs_transform(mb_sym[OBS_KEY])
+            mb_sym[OBS_PRIV_KEY] = self.obs_priv_transform(mb_sym[OBS_PRIV_KEY])
+            mb_sym[CRITIC_PRIV_KEY] = self.critic_priv_transform(mb_sym[CRITIC_PRIV_KEY])
+            mb_sym["is_init"] = mb["is_init"]
 
-        mb_sym = mb_sym.exclude("next")
-        mb = mb.exclude("next")
-        mb = torch.cat([mb, mb_sym], dim=0)
+            mb_sym = mb_sym.exclude("next")
+            mb = mb.exclude("next")
+            mb = torch.cat([mb, mb_sym], dim=0)
+        else:
+            mb = mb.exclude("next")
 
         with torch.no_grad():
             self.encoder_priv(mb)

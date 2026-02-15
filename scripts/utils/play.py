@@ -7,7 +7,6 @@ import os
 import datetime
 from omegaconf import OmegaConf
 
-from isaaclab.app import AppLauncher
 
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 from tensordict.nn import TensorDictSequential
@@ -20,10 +19,12 @@ def play(cfg):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
     
-    app_launcher = AppLauncher(cfg.app)
-    simulation_app = app_launcher.app
 
     env, policy, vecnorm, _ = make_env_policy(cfg)
+    if hasattr(policy, "step_schedule"):
+        policy.step_schedule(1.0, 0)
+    if hasattr(env, "step_schedule"):
+        env.step_schedule(1.0, 0)
 
     if cfg.export_policy:
         import time
@@ -81,4 +82,3 @@ def play(cfg):
                     print(k, torch.mean(v).item())
     
     env.close()
-    simulation_app.close()

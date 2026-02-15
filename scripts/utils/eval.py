@@ -7,7 +7,6 @@ import sys
 from tqdm import tqdm
 from omegaconf import OmegaConf
 
-from isaaclab.app import AppLauncher
 
 from active_adaptation.learning import ALGOS
 
@@ -24,8 +23,6 @@ def eval(cfg):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
     
-    app_launcher = AppLauncher(OmegaConf.to_container(cfg.app))
-    simulation_app = app_launcher.app
 
     env, agent, vecnorm, _ = make_env_policy(cfg)
     
@@ -57,4 +54,3 @@ def eval(cfg):
 
     exit(0)
     env.close()
-    simulation_app.close()

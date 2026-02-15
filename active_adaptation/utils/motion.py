@@ -34,6 +34,12 @@ class MotionData(TensorClass):
     body_angvel_w: torch.Tensor
     body_angvel_b: torch.Tensor
 
+
+class MotionOriginalData(TensorClass):
+    joint_pos: torch.Tensor
+    joint_vel: torch.Tensor
+    body_pos_w: torch.Tensor
+
 from tqdm import tqdm
 
 class MotionDataset:

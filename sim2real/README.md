@@ -15,7 +15,7 @@ uv run src/deploy.py --net lo --sim2sim                # controller (sim)
 uv run src/motion_select.py                            # motion selector
 ```
 
-## Install
+## Install & run with conda (alternative)
 - Create conda environment
   ```
   conda create -n gentle python=3.10
@@ -26,8 +26,6 @@ uv run src/motion_select.py                            # motion selector
   ```bash
   pip install -r requirements.txt
   ```
-
-
 
 ## Run Sim2Sim
 1. Start the simulator (state publisher + keyboard bridge):

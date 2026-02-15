@@ -1,15 +1,19 @@
 import torch
 
 from typing import TYPE_CHECKING
+from pathlib import Path
 
 if TYPE_CHECKING:
-    from isaaclab.assets import RigidObject
-    from isaaclab.sensors import ContactSensor
+    from mjlab.entity import Entity as RigidObject
+    from mjlab.sensor import ContactSensor
 
-from active_adaptation.envs.mdp import reward, termination, observation
-from active_adaptation.utils.multimotion import ProgressiveMultiMotionDataset
+from active_adaptation.envs.mdp import reward, termination, observation, random_noise
+from active_adaptation.utils.multimotion import (
+    ProgressiveMultiMotionDataset,
+)
 from active_adaptation.utils.simple_multimotion import SimpleSequentialMultiMotionDataset
 from active_adaptation.utils import symmetry as sym_utils
+from active_adaptation.utils import joint_order as joint_order_utils
 from active_adaptation.utils.math import (
     quat_apply_inverse,
     quat_apply,
@@ -67,6 +71,52 @@ def convert_dtype(dtype_str):
         return dtype_map[dtype_str]
     return dtype_str
 
+
+def _resolve_joint_indices(
+    motion_joint_names: Sequence[str],
+    asset_joint_names: Sequence[str],
+    ordered_joint_names: Sequence[str],
+    *,
+    ignore_patterns: Sequence[str] | None = None,
+    strict: bool = False,
+    require_non_empty: bool = True,
+    device=None,
+    context: str = "joint mapping",
+):
+    motion_name_to_idx = {n: i for i, n in enumerate(motion_joint_names)}
+    asset_name_to_idx = {n: i for i, n in enumerate(asset_joint_names)}
+
+    selected_joint_names = []
+    joint_idx_motion = []
+    joint_idx_asset = []
+    ignore_patterns = ignore_patterns or []
+
+    for name in ordered_joint_names:
+        if any(re.match(p, name) for p in ignore_patterns):
+            continue
+
+        in_motion = name in motion_name_to_idx
+        in_asset = name in asset_name_to_idx
+        if not (in_motion and in_asset):
+            if strict:
+                raise ValueError(
+                    f"Joint '{name}' in {context} is not found in motion dataset or asset."
+                )
+            continue
+
+        selected_joint_names.append(name)
+        joint_idx_motion.append(motion_name_to_idx[name])
+        joint_idx_asset.append(asset_name_to_idx[name])
+
+    if require_non_empty and len(selected_joint_names) == 0:
+        raise RuntimeError(f"No joints resolved for {context}.")
+
+    return (
+        selected_joint_names,
+        torch.tensor(joint_idx_motion, device=device, dtype=torch.long),
+        torch.tensor(joint_idx_asset, device=device, dtype=torch.long),
+    )
+
 class MotionTrackingCommand(Command):
     def __init__(self, env, dataset: dict,
                 dataset_extra_keys: list[dict] = [],
@@ -77,9 +127,14 @@ class MotionTrackingCommand(Command):
                 joint_patterns: list[str] = [],
                 ignore_joint_patterns: list[str] = [],
                 feet_patterns: list[str] = [],
+                feet_standing_z_enter: float = 0.12,
+                feet_standing_z_exit: float = 0.15,
+                feet_standing_vxy_enter: float = 0.30,
+                feet_standing_vxy_exit: float = 0.50,
+                feet_standing_vz_enter: float = 0.20,
+                feet_standing_vz_exit: float = 0.35,
                 init_noise: dict[str, float] = {},
                 reward_sigma: dict[str, list[float]] = {},
-                student_train: bool = False,
                 future_steps: list[int] = [],
                 cum_root_pos_scale: float = 0.0,
                 cum_keypoint_scale: float = 0.0,
@@ -96,14 +151,13 @@ class MotionTrackingCommand(Command):
         
         self.future_steps = torch.tensor(future_steps, device=self.device)
 
-        self.zero_init_prob = 1.0
+        self.zero_init_prob = 0.0
 
         dataset_extra_keys = [
             {**k, 'dtype': convert_dtype(k['dtype'])} 
             for k in dataset_extra_keys
         ]
 
-        self.student_train = student_train
         self.debug_mode = debug_mode
 
         dataset_cls = SimpleSequentialMultiMotionDataset if self.debug_mode else ProgressiveMultiMotionDataset
@@ -113,10 +167,19 @@ class MotionTrackingCommand(Command):
             max_step_size=1000,
             dataset_extra_keys=dataset_extra_keys,
             device=self.device,
-            ds_device=torch.device("cpu"),
-            refresh_threshold=1000 * 20,
+            ds_device=torch.device("cpu"), # dataset will consume a lot of memory, keep it on CPU and move slices to GPU as needed
         )
-        self.dataset.set_limit(self.asset.data.soft_joint_pos_limits, self.asset.data.soft_joint_vel_limits, self.asset.joint_names)
+        joint_vel_limits = getattr(self.asset.data, "soft_joint_vel_limits", None)
+        if joint_vel_limits is None:
+            joint_vel_limits = torch.zeros_like(self.asset.data.soft_joint_pos_limits)
+            joint_vel_limits[..., 0] = -10.0
+            joint_vel_limits[..., 1] = 10.0
+        self.dataset.set_limit(
+            self.asset.data.soft_joint_pos_limits,
+            joint_vel_limits,
+            self.asset.joint_names,
+        )
+        self._gravity_vec_w = self.asset.data.gravity_vec_w
 
         # bodies for full‑body keypoint tracking
         self.keypoint_patterns = keypoint_patterns
@@ -161,17 +224,34 @@ class MotionTrackingCommand(Command):
             self.feet_patterns,
             device=self.device
         )
+        self.feet_standing_z_enter = float(feet_standing_z_enter)
+        self.feet_standing_z_exit = float(feet_standing_z_exit)
+        self.feet_standing_vxy_enter = float(feet_standing_vxy_enter)
+        self.feet_standing_vxy_exit = float(feet_standing_vxy_exit)
+        self.feet_standing_vz_enter = float(feet_standing_vz_enter)
+        self.feet_standing_vz_exit = float(feet_standing_vz_exit)
 
         # all joints except ankles
         self.ignore_joint_patterns = ignore_joint_patterns
-        all_j_m, all_j_a = [], []
-        for j in self.asset.joint_names:
-            if j in self.dataset.joint_names and not any(re.match(p, j) for p in self.ignore_joint_patterns):
-                all_j_m.append(self.dataset.joint_names.index(j))
-                all_j_a.append(self.asset.joint_names.index(j))
-        self.all_joint_idx_dataset, self.all_joint_idx_asset = all_j_m, all_j_a
-        self.all_joint_idx_dataset = torch.tensor(self.all_joint_idx_dataset, device=self.device)
-        self.all_joint_idx_asset = torch.tensor(self.all_joint_idx_asset, device=self.device)
+        self.all_joint_names, self.all_joint_idx_dataset, self.all_joint_idx_asset = _resolve_joint_indices(
+            self.dataset.joint_names,
+            self.asset.joint_names,
+            self.asset.joint_names,
+            ignore_patterns=self.ignore_joint_patterns,
+            strict=False,
+            device=self.device,
+            context="all_joint_idx",
+        )
+
+        # joint indices for target_joint_pos_obs: follow asset-configured canonical order.
+        self.target_joint_names, self.target_joint_idx_motion, self.target_joint_idx_asset = _resolve_joint_indices(
+            self.dataset.joint_names,
+            self.asset.joint_names,
+            joint_order_utils.get_joint_name_order(self.asset),
+            strict=True,
+            device=self.device,
+            context="asset canonical order",
+        )
 
         self.last_reset_env_ids = None
 
@@ -194,7 +274,9 @@ class MotionTrackingCommand(Command):
             device=self.device
         )
 
-        self.feet_standing = torch.zeros(self.num_envs, 2, dtype=torch.bool, device=self.device)
+        self.feet_standing = torch.zeros(
+            self.num_envs, int(self.feet_idx_motion.numel()), dtype=torch.bool, device=self.device
+        )
 
         self.lengths = torch.full((self.num_envs,), 1, dtype=torch.int32, device=self.device)
         self.t = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
@@ -213,33 +295,32 @@ class MotionTrackingCommand(Command):
 
     def sample_init(self, env_ids: torch.Tensor):
         t = self.t[env_ids]
-        lengths = self.lengths[env_ids]
         self.last_reset_env_ids = env_ids
         # resample motion
         lengths = self.dataset.reset(env_ids)
 
         n = env_ids.shape[0]
-        rand_vals = torch.rand(n, 2, device=self.device)
-        
-        cached_t = torch.full_like(t, -1)
-        if (
-            (not self.debug_mode)
-            and self.reinit_prob > 0.0
-            and self.reinit_max_steps > 0
-            and self.reinit_max_steps >= self.reinit_min_steps
-        ):
-            chosen_mask = self._reinit_requested[env_ids] & (rand_vals[:, 0] < self.reinit_prob)
-            rewind = (rand_vals[:, 1] * (self.reinit_max_steps - self.reinit_min_steps + 1)).to(self.t.dtype) + self.reinit_min_steps
-            cached_t = torch.where(chosen_mask, (t - rewind).clamp_min(0), cached_t)
-            self._reinit_requested[env_ids] = False
 
         if self.debug_mode:
             t[:] = 0
         else:
-            max_start = lengths - self.future_steps[-1] - 1
-            offsets = (rand_vals[:, 0] * 0.75 * max_start.to(torch.float32)).floor().to(self.t.dtype)
-            t_rand = offsets * (rand_vals[:, 1] > self.zero_init_prob)
-            t[:] = torch.where(cached_t >= 0, cached_t.clamp(max=max_start), t_rand)
+            # --- 1) reinit: rewind from previous t when requested ---
+            use_reinit = torch.zeros(n, dtype=torch.bool, device=self.device)
+            if self.reinit_prob > 0.0:
+                use_reinit = self._reinit_requested[env_ids] & (torch.rand(n, device=self.device) < self.reinit_prob)
+                rewind = torch.randint(self.reinit_min_steps, self.reinit_max_steps + 1, (n,), device=self.device, dtype=self.t.dtype)
+                reinit_t = (t - rewind).clamp(min=0)
+                self._reinit_requested[env_ids] = False
+
+            # --- 2) random sample: uniform in [0, sample_interval), with zero_init_prob chance of t=0 ---
+            max_start = (lengths - self.future_steps[-1] - 1).clamp_min(0)
+            sample_interval = torch.minimum(max_start * 3 // 4, max_start - 100).clamp_min(0)
+            t_rand = (torch.rand(n, device=self.device) * sample_interval.to(torch.float32)).floor().to(self.t.dtype)
+            zero_init = torch.rand(n, device=self.device) < self.zero_init_prob
+            t_rand = torch.where(zero_init, torch.zeros_like(t_rand), t_rand)
+
+            # --- merge: reinit takes priority over random ---
+            t[:] = torch.where(use_reinit, reinit_t, t_rand)
 
         self.lengths[env_ids] = lengths
         self.t[env_ids] = t
@@ -290,6 +371,8 @@ class MotionTrackingCommand(Command):
 
         # -------- joint state ----------------------------------------------------
         init_joint_pos[:, self.all_joint_idx_asset] = motion_joint_pos[:, self.all_joint_idx_dataset]
+        self.joint_pos_boot_protect[env_ids] = init_joint_pos
+
         init_joint_vel[:, self.all_joint_idx_asset] = motion_joint_vel[:, self.all_joint_idx_dataset]
         joint_pos_noise = torch.randn_like(init_joint_pos).clamp(-1, 1) * self.init_noise_params["joint_pos"]
         joint_vel_noise = torch.randn_like(init_joint_vel).clamp(-1, 1) * self.init_noise_params["joint_vel"]
@@ -298,27 +381,33 @@ class MotionTrackingCommand(Command):
 
         # Apply the calculated states to the simulation
         self.asset.write_root_state_to_sim(init_root_state, env_ids=env_ids)
-
-        self.joint_pos_boot_protect[env_ids] = init_joint_pos
-
         self.asset.write_joint_position_to_sim(init_joint_pos, env_ids=env_ids)
-        self.asset.set_joint_position_target(init_joint_pos, env_ids=env_ids)
         self.asset.write_joint_velocity_to_sim(init_joint_vel, env_ids=env_ids)
-
-        self.asset.write_data_to_sim()
+        self.asset.set_joint_position_target(init_joint_pos, env_ids=env_ids)
     
     def reset(self, env_ids):
         self.finished[env_ids] = False
         self.boot_indicator[env_ids] = self.boot_indicator_max
         self._cum_error[env_ids] = 0.0
+        self.feet_standing[env_ids] = False
 
     @termination
     def body_z_termination(self):
         if self.body_z_terminate_thres <= 0 or self.body_z_idx_asset.numel() == 0:
             return torch.zeros((self.num_envs, 1), dtype=torch.bool, device=self.device)
         target_z = self._motion.body_pos_w[:, 0, self.body_z_idx_motion, 2]
-        current_z = self.asset.data.body_pos_w[:, self.body_z_idx_asset, 2]
-        exceed = (target_z.sub(current_z).abs() > self.body_z_terminate_thres).any(dim=1, keepdim=True)
+        target_z_min_thres = target_z - self.body_z_terminate_thres # [N, B]
+        target_z_max_thres = target_z + self.body_z_terminate_thres # [N, B]
+        target_z_min = target_z.amin(dim=1, keepdim=True)
+        # Relax lower bound for airborne motions:
+        # target_z_min <= 0.1: no relax
+        # target_z_min >= 0.3: max relax = 0.2
+        # in-between: linear interpolation
+        lower_relax = ((target_z_min - 0.1) / 0.2).clamp(0.0, 1.0) * 0.2
+        target_z_min_thres = target_z_min_thres - lower_relax
+
+        current_z = self.asset.data.body_link_pos_w[:, self.body_z_idx_asset, 2] # [N, B]
+        exceed = ((current_z < target_z_min_thres) | (current_z > target_z_max_thres)).any(dim=1, keepdim=True)
         self._reinit_requested.logical_or_(exceed.view(-1))
         return exceed
 
@@ -327,16 +416,31 @@ class MotionTrackingCommand(Command):
         if self.gravity_terminate_thres <= 0:
             return torch.zeros((self.num_envs, 1), dtype=torch.bool, device=self.device)
         motion_quat = self._motion.root_quat_w[:, 0]
-        motion_g_b = quat_apply_inverse(motion_quat, self.asset.data.GRAVITY_VEC_W)
-        current_quat = self.asset.data.root_quat_w
-        robot_g_b = quat_apply_inverse(current_quat, self.asset.data.GRAVITY_VEC_W)
+        motion_g_b = quat_apply_inverse(motion_quat, self._gravity_vec_w)
+        current_quat = self.asset.data.root_link_quat_w
+        robot_g_b = quat_apply_inverse(current_quat, self._gravity_vec_w)
         exceed = (motion_g_b[:, 2:] - robot_g_b[:, 2:]).abs() > self.gravity_terminate_thres
         self._reinit_requested.logical_or_(exceed.view(-1))
         return exceed
 
     @observation
-    def command(self):
-        root_quat = self.asset.data.root_quat_w.unsqueeze(1)
+    def command_obs(self, noise_std: float = 0.0):
+        root_quat = self.asset.data.root_link_quat_w
+        if noise_std > 0.0:
+            noise_axis = torch.randn(
+                (self.num_envs, 3),
+                device=self.device,
+                dtype=root_quat.dtype,
+            )
+            noise_axis = noise_axis / noise_axis.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            noise_angle = torch.randn(
+                (self.num_envs,),
+                device=self.device,
+                dtype=root_quat.dtype,
+            ).clamp(-3, 3) * noise_std
+            noise_quat = quat_from_angle_axis(noise_angle, noise_axis)
+            root_quat = quat_mul(noise_quat, root_quat)
+        root_quat = root_quat.unsqueeze(1)
         root_quat_future = self._motion.root_quat_w[:, 0:, :]
         root_quat_future0 = self._motion.root_quat_w[:, 0, :].unsqueeze(1)
 
@@ -361,7 +465,7 @@ class MotionTrackingCommand(Command):
             rot6d_diff.reshape(self.num_envs, -1),
         ], dim=-1)
 
-    def command_sym(self):
+    def command_obs_sym(self):
         return sym_utils.SymmetryTransform.cat([
             sym_utils.SymmetryTransform(perm=torch.arange(3), signs=[1, -1, 1]).repeat(len(self.future_steps) - 1),
             sym_utils.SymmetryTransform(
@@ -379,8 +483,8 @@ class MotionTrackingCommand(Command):
 
     @observation
     def target_pos_b_obs(self):
-        current_pos = self.asset.data.root_pos_w.unsqueeze(1) - self.env.scene.env_origins.unsqueeze(1)
-        current_quat = self.asset.data.root_quat_w.unsqueeze(1)
+        current_pos = self.asset.data.root_link_pos_w.unsqueeze(1) - self.env.scene.env_origins.unsqueeze(1)
+        current_quat = self.asset.data.root_link_quat_w.unsqueeze(1)
         target_pos_b = quat_apply_inverse(
             current_quat,
             (self._motion.root_pos_w - current_pos)
@@ -391,10 +495,25 @@ class MotionTrackingCommand(Command):
             perm=torch.arange(3),
             signs=[1., -1., 1.]
         ).repeat(len(self.future_steps))
+
+    @observation
+    def target_rot_b_obs(self):
+        relative_quat = quat_mul(
+            quat_conjugate(self.asset.data.root_link_quat_w.unsqueeze(1)),
+            self._motion.root_quat_w
+        )
+        rotmat = matrix_from_quat(relative_quat)
+        rot6d = rotmat[..., :, :2].transpose(-2, -1)
+        return rot6d.reshape(self.num_envs, -1)
+    def target_rot_b_obs_sym(self):
+        return sym_utils.SymmetryTransform(
+            perm=torch.arange(6),
+            signs=[1, -1, 1, -1, 1, -1]
+        ).repeat(len(self.future_steps))
     
     @observation
     def target_linvel_b_obs(self):
-        target_linvel_b = quat_apply_inverse(self.asset.data.root_quat_w.unsqueeze(1), self._motion.root_lin_vel_w)
+        target_linvel_b = quat_apply_inverse(self.asset.data.root_link_quat_w.unsqueeze(1), self._motion.root_lin_vel_w)
         return target_linvel_b.reshape(self.num_envs, -1)
     def target_linvel_b_obs_sym(self):
         return sym_utils.SymmetryTransform(
@@ -403,90 +522,191 @@ class MotionTrackingCommand(Command):
         ).repeat(len(self.future_steps))
 
     @observation
-    def target_projected_gravity_b(self):
+    def target_angvel_b_obs(self):
+        target_angvel_b = quat_apply_inverse(
+            self.asset.data.root_link_quat_w.unsqueeze(1),
+            self._motion.root_ang_vel_w,
+        )
+        return target_angvel_b.reshape(self.num_envs, -1)
+    def target_angvel_b_obs_sym(self):
+        return sym_utils.SymmetryTransform(
+            perm=torch.arange(3),
+            signs=[-1., 1., -1.]
+        ).repeat(len(self.future_steps))
+
+    @observation
+    def target_projected_gravity_b_obs(self):
         gravity = torch.tensor([0.0, 0.0, -1.0], device=self.device, dtype=torch.float32).reshape(1, 1, 3)
         g_b = quat_apply_inverse(self._motion.root_quat_w, gravity)  # [N, S, 3]
         return g_b.reshape(self.num_envs, -1)
 
-    def target_projected_gravity_b_sym(self):
+    def target_projected_gravity_b_obs_sym(self):
         return sym_utils.SymmetryTransform(
             perm=torch.arange(3),
             signs=[1., -1., 1.]
         ).repeat(len(self.future_steps))
 
     @observation
-    def target_keypoints_b_obs(self):
+    def target_keypoints_pos_b_obs(self):
         target_keypoints_b = self._motion.body_pos_b[:, :, self.keypoint_idx_motion]
-        return target_keypoints_b.reshape(self.num_envs, -1)
-    def target_keypoints_b_obs_sym(self):
-        return sym_utils.cartesian_space_symmetry(self.asset, get_items_by_index(self.asset.body_names, self.keypoint_idx_asset), sign=[1, -1, 1]).repeat(len(self.future_steps))
-    
-    @observation
-    def target_keypoints_diff_b_obs(self):
-        actual_w = self.asset.data.body_pos_w[:, self.keypoint_idx_asset] - self.env.scene.env_origins.unsqueeze(1)
-        target_w = self._motion.body_pos_w[:, :, self.keypoint_idx_motion]
-        diff_w = target_w - actual_w.unsqueeze(1)
-        diff_b = quat_apply_inverse(
-            self.asset.data.root_quat_w.unsqueeze(1).unsqueeze(1),
-            diff_w
-        )
-        return diff_b.reshape(self.num_envs, -1)
-    def target_keypoints_diff_b_obs_sym(self):
-        return sym_utils.cartesian_space_symmetry(self.asset, get_items_by_index(self.asset.body_names, self.keypoint_idx_asset), sign=[1, -1, 1]).repeat(len(self.future_steps))
 
-    @observation
-    def relative_quat_obs(self):
-        relative_quat = quat_mul(
-            quat_conjugate(self.asset.data.root_quat_w.unsqueeze(1)),
-            self._motion.root_quat_w
-        )
-        rotmat = matrix_from_quat(relative_quat)
-        rot6d = rotmat[..., :, :2].transpose(-2, -1)
-        return rot6d.reshape(self.num_envs, -1)
-    def relative_quat_obs_sym(self):
-        return sym_utils.SymmetryTransform(
-            perm=torch.arange(6),
-            signs=[1, -1, 1, -1, 1, -1]
-        ).repeat(len(self.future_steps))
-
-    @observation
-    def target_joint_pos_obs(self):
-        return self._motion.joint_pos.reshape(self.num_envs, -1)
-    def target_joint_pos_obs_sym(self):
-        return sym_utils.joint_space_symmetry(self.asset, self.dataset.joint_names).repeat(len(self.future_steps))
-
-
-    @observation
-    def current_keypoint_b(self):
-        actual_w = self.asset.data.body_pos_w[:, self.keypoint_idx_asset]
+        actual_w = self.asset.data.body_link_pos_w[:, self.keypoint_idx_asset] - self.asset.data.root_link_pos_w.unsqueeze(1) # N, B, 3
         actual_b = quat_apply_inverse(
-            self.asset.data.root_quat_w.unsqueeze(1),
-            actual_w - self.asset.data.root_pos_w.unsqueeze(1)
+            self.asset.data.root_link_quat_w.unsqueeze(1),
+            actual_w
+        ) # N, B, 3
+        target_w = self._motion.body_pos_w[:, :, self.keypoint_idx_motion] - self._motion.root_pos_w[:, 0:1, :].unsqueeze(2) # [N, S, B, 3] - [N, 1, 1, 3] = [N, S, B, 3]
+        target_b = quat_apply_inverse(
+            self._motion.root_quat_w[:, 0:1, :].unsqueeze(2), # [N, 1, 1, 4]
+            target_w
+        ) # [N, S, B, 3]
+        diff_b = target_b - actual_b.unsqueeze(1) # [N, S, B, 3] - [N, 1, B, 3] = [N, S, B, 3]
+        return torch.cat(
+            [
+                target_keypoints_b.reshape(self.num_envs, -1),
+                diff_b.reshape(self.num_envs, -1),
+            ],
+            dim=-1,
+        )
+    def target_keypoints_pos_b_obs_sym(self):
+        transform = sym_utils.cartesian_space_symmetry(
+            self.asset,
+            get_items_by_index(self.asset.body_names, self.keypoint_idx_asset),
+            sign=[1, -1, 1],
+        ).repeat(len(self.future_steps))
+        return sym_utils.SymmetryTransform.cat([transform, transform])
+
+    @observation
+    def target_keypoints_rot_b_obs(self):
+        target_quat_b = self._motion.body_quat_b[:, :, self.keypoint_idx_motion]
+        target_rot6d_b = matrix_from_quat(target_quat_b)[..., :, :2].transpose(-2, -1)
+
+        actual_quat_b = quat_mul(
+            quat_conjugate(self.asset.data.root_link_quat_w).unsqueeze(1),
+            self.asset.data.body_link_quat_w[:, self.keypoint_idx_asset],
+        )  # [N, B, 4]
+        target_quat_ref = quat_mul(
+            quat_conjugate(self._motion.root_quat_w[:, 0:1, :]).unsqueeze(2),  # [N, 1, 1, 4]
+            self._motion.body_quat_w[:, :, self.keypoint_idx_motion],          # [N, S, B, 4]
+        )  # [N, S, B, 4]
+        diff_quat_b = quat_mul(
+            target_quat_ref,
+            quat_conjugate(actual_quat_b.unsqueeze(1)),
+        )  # [N, S, B, 4]
+        diff_rot6d_b = matrix_from_quat(diff_quat_b)[..., :, :2].transpose(-2, -1)
+
+        return torch.cat(
+            [
+                target_rot6d_b.reshape(self.num_envs, -1),
+                diff_rot6d_b.reshape(self.num_envs, -1),
+            ],
+            dim=-1,
+        )
+    def target_keypoints_rot_b_obs_sym(self):
+        transform = sym_utils.cartesian_space_symmetry(
+            self.asset,
+            get_items_by_index(self.asset.body_names, self.keypoint_idx_asset),
+            sign=[1, -1, 1, -1, 1, -1],
+        ).repeat(len(self.future_steps))
+        return sym_utils.SymmetryTransform.cat([transform, transform])
+
+    @observation
+    def target_joint_pos_obs(self, noise_std: float = 0.0):
+        target_joint_pos = self._motion.joint_pos[:, :, self.target_joint_idx_motion]
+        current_joint_pos = self.asset.data.joint_pos[:, self.target_joint_idx_asset] - self.env.action_manager.offset[:, self.target_joint_idx_asset]
+        if noise_std > 0.0:
+            current_joint_pos = random_noise(current_joint_pos, noise_std)
+        current_joint_pos = current_joint_pos.unsqueeze(1) # N, 1, J
+        target_minus_current = target_joint_pos - current_joint_pos # N, T, J
+        return torch.cat(
+            [
+                target_joint_pos.reshape(self.num_envs, -1),
+                target_minus_current.reshape(self.num_envs, -1),
+            ],
+            dim=-1,
+        )
+    def target_joint_pos_obs_sym(self):
+        transform = sym_utils.joint_space_symmetry(self.asset, self.target_joint_names).repeat(
+            len(self.future_steps)
+        )
+        return sym_utils.SymmetryTransform.cat([transform, transform])
+
+
+    @observation
+    def current_keypoint_pos_b_obs(self):
+        actual_w = self.asset.data.body_link_pos_w[:, self.keypoint_idx_asset]
+        actual_b = quat_apply_inverse(
+            self.asset.data.root_link_quat_w.unsqueeze(1),
+            actual_w - self.asset.data.root_link_pos_w.unsqueeze(1)
         )
         return actual_b.reshape(self.num_envs, -1)
-    def current_keypoint_b_sym(self):
+    def current_keypoint_pos_b_obs_sym(self):
         return sym_utils.cartesian_space_symmetry(self.asset, get_items_by_index(self.asset.body_names, self.keypoint_idx_asset), sign=[1, -1, 1])
 
     @observation
-    def current_keypoint_vel_b(self):
-        actual_vel_w = self.asset.data.body_lin_vel_w[:, self.keypoint_idx_asset]
+    def current_keypoint_rot_b_obs(self):
+        root_quat_w = self.asset.data.root_link_quat_w
+        actual_quat_b = quat_mul(
+            quat_conjugate(root_quat_w).unsqueeze(1),
+            self.asset.data.body_link_quat_w[:, self.keypoint_idx_asset],
+        )
+        rotmat = matrix_from_quat(actual_quat_b)
+        rot6d = rotmat[..., :, :2].transpose(-2, -1)
+        return rot6d.reshape(self.num_envs, -1)
+    def current_keypoint_rot_b_obs_sym(self):
+        return sym_utils.cartesian_space_symmetry(
+            self.asset,
+            get_items_by_index(self.asset.body_names, self.keypoint_idx_asset),
+            sign=[1, -1, 1, -1, 1, -1],
+        )
+
+    @observation
+    def current_keypoint_linvel_b_obs(self):
+        actual_vel_w = self.asset.data.body_link_lin_vel_w[:, self.keypoint_idx_asset]
+        root_vel_w = self.asset.data.root_link_lin_vel_w.unsqueeze(1)
         actual_vel_b = quat_apply_inverse(
-            self.asset.data.root_quat_w.unsqueeze(1),
-            actual_vel_w
+            self.asset.data.root_link_quat_w.unsqueeze(1),
+            actual_vel_w - root_vel_w
         )
         return actual_vel_b.reshape(self.num_envs, -1)
-    def current_keypoint_vel_b_sym(self):
+    def current_keypoint_linvel_b_obs_sym(self):
         return sym_utils.cartesian_space_symmetry(self.asset, get_items_by_index(self.asset.body_names, self.keypoint_idx_asset), sign=[1, -1, 1])
+
+    @observation
+    def current_keypoint_angvel_b_obs(self):
+        actual_angvel_w = self.asset.data.body_link_ang_vel_w[:, self.keypoint_idx_asset]
+        root_angvel_w = self.asset.data.root_link_ang_vel_w.unsqueeze(1)
+        actual_angvel_b = quat_apply_inverse(
+            self.asset.data.root_link_quat_w.unsqueeze(1),
+            actual_angvel_w - root_angvel_w,
+        )
+        return actual_angvel_b.reshape(self.num_envs, -1)
+    def current_keypoint_angvel_b_obs_sym(self):
+        return sym_utils.cartesian_space_symmetry(
+            self.asset,
+            get_items_by_index(self.asset.body_names, self.keypoint_idx_asset),
+            sign=[-1, 1, -1],
+        )
     
     @observation
-    def boot_indicator_state(self):
+    def boot_indicator_state_obs(self):
         return self.boot_indicator / self.boot_indicator_max
-    def boot_indicator_state_sym(self):
+    def boot_indicator_state_obs_sym(self):
         return sym_utils.SymmetryTransform(perm=torch.arange(1), signs=[1.])
+
+    @observation
+    def target_feet_contact_state_obs(self):
+        return self.feet_standing.float()
+    def target_feet_contact_state_obs_sym(self):
+        return sym_utils.cartesian_space_symmetry(
+            self.asset,
+            get_items_by_index(self.asset.body_names, self.feet_idx_asset),
+            sign=(1,),
+        )
 
     @reward
     def root_pos_tracking(self):
-        current_pos = self.asset.data.root_pos_w
+        current_pos = self.asset.data.root_link_pos_w
         target_pos = self.reward_root_pos_w
         diff = target_pos - current_pos
         error = diff.norm(dim=-1, keepdim=True)
@@ -495,8 +715,8 @@ class MotionTrackingCommand(Command):
 
     @reward
     def root_vel_tracking(self):
-        current_linvel_w = self.asset.data.root_lin_vel_w
-        current_quat = self.asset.data.root_quat_w
+        current_linvel_w = self.asset.data.root_link_lin_vel_w
+        current_quat = self.asset.data.root_link_quat_w
         ref_linvel_w = self._motion.root_lin_vel_w[:, 0]
         ref_quat = self._motion.root_quat_w[:, 0, :]
 
@@ -509,7 +729,7 @@ class MotionTrackingCommand(Command):
 
     @reward
     def root_rot_tracking(self):
-        current_quat = self.asset.data.root_quat_w
+        current_quat = self.asset.data.root_link_quat_w
         target_quat = self.reward_root_quat_w
         diff = axis_angle_from_quat(quat_mul(
             target_quat,
@@ -521,8 +741,8 @@ class MotionTrackingCommand(Command):
     
     @reward
     def root_ang_vel_tracking(self):
-        current_angvel_w = self.asset.data.root_ang_vel_w
-        current_quat = self.asset.data.root_quat_w
+        current_angvel_w = self.asset.data.root_link_ang_vel_w
+        current_quat = self.asset.data.root_link_quat_w
         ref_angvel_w = self._motion.root_ang_vel_w[:, 0]
         ref_quat = self._motion.root_quat_w[:, 0, :]
 
@@ -560,11 +780,11 @@ class MotionTrackingCommand(Command):
 
     @reward
     def keypoint_vel_tracking(self):
-        current_root_quat = self.asset.data.root_quat_w
-        actual_vel_w = self.asset.data.body_lin_vel_w[:, self.keypoint_idx_asset]
+        current_root_quat = self.asset.data.root_link_quat_w
+        actual_vel_w = self.asset.data.body_link_lin_vel_w[:, self.keypoint_idx_asset]
         actual_vel_b = quat_apply_inverse(
             current_root_quat.unsqueeze(1),
-            actual_vel_w - self.asset.data.root_lin_vel_w.unsqueeze(1),
+            actual_vel_w - self.asset.data.root_link_lin_vel_w.unsqueeze(1),
         )
 
         target_vel_b = self._motion.body_vel_b[:, 0, self.keypoint_idx_motion]
@@ -573,10 +793,10 @@ class MotionTrackingCommand(Command):
 
     @reward
     def keypoint_rot_tracking(self):
-        current_root_quat = self.asset.data.root_quat_w
+        current_root_quat = self.asset.data.root_link_quat_w
         actual_quat_b = quat_mul(
             quat_conjugate(current_root_quat).unsqueeze(1),
-            self.asset.data.body_quat_w[:, self.keypoint_idx_asset],
+            self.asset.data.body_link_quat_w[:, self.keypoint_idx_asset],
         )
         target_quat_b = self._motion.body_quat_b[:, 0, self.keypoint_idx_motion]
         diff = axis_angle_from_quat(quat_mul(target_quat_b, quat_conjugate(actual_quat_b)))
@@ -585,9 +805,9 @@ class MotionTrackingCommand(Command):
 
     @reward
     def keypoint_angvel_tracking(self):
-        current_root_quat = self.asset.data.root_quat_w
-        actual_angvel_w = self.asset.data.body_ang_vel_w[:, self.keypoint_idx_asset]
-        root_angvel_w = self.asset.data.root_ang_vel_w.unsqueeze(1)
+        current_root_quat = self.asset.data.root_link_quat_w
+        actual_angvel_w = self.asset.data.body_link_ang_vel_w[:, self.keypoint_idx_asset]
+        root_angvel_w = self.asset.data.root_link_ang_vel_w.unsqueeze(1)
         actual_angvel_b = quat_apply_inverse(
             current_root_quat.unsqueeze(1),
             actual_angvel_w - root_angvel_w,
@@ -603,7 +823,7 @@ class MotionTrackingCommand(Command):
         sigma_key: str,
         update_cum_error: bool = False,
     ):
-        actual = self.asset.data.body_pos_w[:, keypoint_idx_asset]
+        actual = self.asset.data.body_link_pos_w[:, keypoint_idx_asset]
         target = self.reward_keypoints_w[:, keypoint_idx_motion]
         diff = target - actual
         error = diff.norm(dim=-1).mean(dim=-1, keepdim=True)
@@ -627,13 +847,13 @@ class MotionTrackingCommand(Command):
 
     def update_reward_target_raw(self):
         delta_quat = quat_mul(
-            self.asset.data.root_quat_w,
+            self.asset.data.root_link_quat_w,
             quat_conjugate(self._motion.root_quat_w[:, 0])
         )
         tgt_rel = self._motion.body_pos_w[:, 0] - self._motion.root_pos_w[:, 0].unsqueeze(1)
-        self.reward_keypoints_w = quat_apply(delta_quat.unsqueeze(1), tgt_rel) + self.asset.data.root_pos_w.unsqueeze(1)
+        self.reward_keypoints_w = quat_apply(delta_quat.unsqueeze(1), tgt_rel) + self.asset.data.root_link_pos_w.unsqueeze(1)
 
-        if not self.student_train:
+        if not self.env.student_train:
             self.reward_root_pos_w = self._motion.root_pos_w[:, 0] + self.env.scene.env_origins
             self.reward_root_quat_w = self._motion.root_quat_w[:, 0]
         else:
@@ -650,8 +870,8 @@ class MotionTrackingCommand(Command):
             # roll forward the cache
             self.ts_root_pos_w[:, :-1] = self.ts_root_pos_w[:, 1:]
             # compute target root pos/rot at t+steps
-            current_pos_t = self.asset.data.root_pos_w
-            current_quat_t = self.asset.data.root_quat_w
+            current_pos_t = self.asset.data.root_link_pos_w
+            current_quat_t = self.asset.data.root_link_quat_w
 
             ref_motion_plus = self.dataset.get_slice(None, self.t, steps=torch.tensor([steps], device=self.device, dtype=torch.int64))
             ref_pos_t = self._motion.root_pos_w[:, 0]
@@ -671,9 +891,29 @@ class MotionTrackingCommand(Command):
 
         self._motion = self.dataset.get_slice(None, self.t, steps=self.future_steps)
 
-        self.feet_standing = (self._motion.body_vel_w[:, 0, self.feet_idx_motion, :].norm(dim=-1, keepdim=False) < 0.2) & (self._motion.body_pos_w[:, 0, self.feet_idx_motion, 2] < 0.15)
+        feet_vel_w = self._motion.body_vel_w[:, 0, self.feet_idx_motion, :]
+        feet_pos_w = self._motion.body_pos_w[:, 0, self.feet_idx_motion, :]
+        root_vxy = self._motion.root_lin_vel_w[:, 0, :2].norm(dim=-1, keepdim=True).clamp_min(1.0)
+
+        feet_vxy = feet_vel_w[..., :2].norm(dim=-1)
+        feet_vz_abs = feet_vel_w[..., 2].abs()
+        feet_z = feet_pos_w[..., 2]
+
+        enter_contact = (
+            (feet_z < self.feet_standing_z_enter)
+            & (feet_vxy < self.feet_standing_vxy_enter * root_vxy)
+            & (feet_vz_abs < self.feet_standing_vz_enter * root_vxy)
+        )
+        exit_contact = (
+            (feet_z > self.feet_standing_z_exit)
+            | (feet_vxy > self.feet_standing_vxy_exit * root_vxy)
+            | (feet_vz_abs > self.feet_standing_vz_exit * root_vxy)
+        )
+
+        self.feet_standing = (self.feet_standing & (~exit_contact)) | enter_contact
 
         self.update_reward_target_raw()
+        # self.sample_init_robot(torch.arange(self.num_envs, device=self.device), self._motion, lift_height=0.0)
 
     def update(self):
         self.dataset.update()
@@ -681,8 +921,8 @@ class MotionTrackingCommand(Command):
             self.last_reset_env_ids = None
 
     def debug_draw(self):
-        root_pos = self.asset.data.root_pos_w    # [N,1,3]
-        root_quat = self.asset.data.root_quat_w  # [N,1,4]
+        root_pos = self.asset.data.root_link_pos_w    # [N,1,3]
+        root_quat = self.asset.data.root_link_quat_w  # [N,1,4]
         target_root_quat = self.reward_root_quat_w  # [N,1,4]
         heading_rel = torch.tensor([1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, 3)
         heading_world = quat_apply(root_quat, heading_rel)
@@ -690,7 +930,8 @@ class MotionTrackingCommand(Command):
 
         # —— original world‐frame drawing —— 
         target_keypoints_w = self.reward_keypoints_w[:, self.keypoint_idx_motion]
-        robot_keypoints_w = self.asset.data.body_pos_w[:, self.keypoint_idx_asset]
+        target_keypoints_w_raw = self._motion.body_pos_w[:, 0, self.keypoint_idx_motion] + self.env.scene.env_origins.unsqueeze(1)
+        robot_keypoints_w = self.asset.data.body_link_pos_w[:, self.keypoint_idx_asset]
 
         # draw points and error vectors
         self.env.debug_draw.point(
@@ -698,6 +939,9 @@ class MotionTrackingCommand(Command):
         )
         self.env.debug_draw.point(
             robot_keypoints_w.reshape(-1, 3), color=(0, 1, 0, 1)
+        )
+        self.env.debug_draw.point(
+            target_keypoints_w_raw.reshape(-1, 3), color=(1, 0.5, 0, 1), size=40.0
         )
         self.env.debug_draw.vector(
             robot_keypoints_w.reshape(-1, 3),
@@ -725,3 +969,286 @@ class MotionTrackingCommand(Command):
                     color=(1, 1, 0, 1),
                     size=20.0,
                 )
+
+from .utils import clamp_norm, rand_points_isotropic
+
+class MotionTrackingComplianceCommand(MotionTrackingCommand):
+    def __init__(
+        self,
+        env,
+        dataset: dict,
+        upper_force_keypoint_patterns: list[str] = [".*_hand_mimic", ".*wrist_roll_link.*"],
+        modify_ac_len_range: Sequence[int] = (100, 800),
+        modify_b_ratio_range: Sequence[float] = (0.3, 0.7),
+        modify_fps: float = 50.0,
+        modify_b_tmid_prob: float = 0.2,
+        modify_b_dataset_prob: float = 0.8,
+        modify_joint_left_patterns: list[str] = (".*left_.*shoulder.*", ".*left_.*elbow.*"),
+        modify_joint_right_patterns: list[str] = (".*right_.*shoulder.*", ".*right_.*elbow.*"),
+        modify_fk_base_body_name: str = "pelvis",
+        modify_fk_ee_link_names: Sequence[str] = ("left_hand_mimic", "right_hand_mimic"),
+        modify_resample_countdown_steps: int = 5000,
+        modify_resample_prob: float = 0.75,
+        force_threshold_range: Sequence[float] = (10.0, 20.0),
+        *args,
+        **kwargs,
+    ):
+        super().__init__(env, dataset, *args, **kwargs)
+        self.modify_resample_countdown_steps = int(modify_resample_countdown_steps)
+        self.modify_resample_prob = float(modify_resample_prob)
+        self.modify_countdown = torch.zeros(
+            (self.num_envs,),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.modify_countdown[:] = torch.randint(0, self.modify_resample_countdown_steps, (self.num_envs,), device=self.device)
+        self.modify_suitable_flags = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.compliance_flag = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.force_threshold_min = float(force_threshold_range[0])
+        self.force_threshold_max = float(force_threshold_range[1])
+        self.force_threshold = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
+        self.force_kp = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
+        self._motion_modified_mask = torch.zeros(
+            (self.num_envs, len(self.future_steps)), dtype=torch.bool, device=self.device
+        )
+
+        self.upper_force_keypoint_patterns = upper_force_keypoint_patterns
+        self.upper_force_keypoint_idx_motion, self.upper_force_keypoint_idx_asset = _match_indices(
+            self.dataset.body_names,
+            self.asset.body_names,
+            self.upper_force_keypoint_patterns,
+            name_map=self.keypoint_map,
+            device=self.device,
+        )
+        self.torso_idx_motion, self.torso_idx_asset = _match_indices(
+            self.dataset.body_names,
+            self.asset.body_names,
+            [".*torso.*"],
+            name_map=self.keypoint_map,
+            device=self.device,
+        )
+        if self.torso_idx_motion.numel() != 1 or self.torso_idx_asset.numel() != 1:
+            raise ValueError(
+                "Torso index matching must resolve exactly one body in both motion and asset. "
+                f"got motion={self.torso_idx_motion.tolist()}, asset={self.torso_idx_asset.tolist()}"
+            )
+        self.upper_force_applied = torch.zeros((self.num_envs, len(self.upper_force_keypoint_idx_asset), 3), dtype=torch.float32, device=self.device)
+        self.torso_force_applied = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        self.torso_torque_applied = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        self.net_force_limit_max = torch.as_tensor(20.0, dtype=torch.float32, device=self.device)
+        self.net_torque_limit_max = torch.as_tensor(10.0, dtype=torch.float32, device=self.device)
+        self.net_limit_full_progress = 0.75
+        self.net_force_limit = torch.zeros((), dtype=torch.float32, device=self.device)
+        self.net_torque_limit = torch.zeros((), dtype=torch.float32, device=self.device)
+
+        bank_path = Path(__file__).resolve().parent / "g1_tracking_compliance.pt"
+        bank_obj = torch.load(str(bank_path), map_location="cpu")
+        modify_joint_pos_bank = bank_obj["joint_pos"]
+        bank_joint_names = bank_obj.get("joint_names", None)
+        if bank_joint_names is not None and list(bank_joint_names) != list(self.dataset.joint_names):
+            raise ValueError("joint bank joint_names mismatch with current dataset.joint_names")
+
+        self.dataset.setup_joint_modification(
+            ac_len_range=modify_ac_len_range,
+            b_ratio_range=modify_b_ratio_range,
+            fps=modify_fps,
+            modify_b_tmid_prob=modify_b_tmid_prob,
+            modify_b_dataset_prob=modify_b_dataset_prob,
+            modify_joint_pos_bank=modify_joint_pos_bank,
+            modify_joint_left_patterns=modify_joint_left_patterns,
+            modify_joint_right_patterns=modify_joint_right_patterns,
+            fk_asset=self.asset,
+            fk_base_body_name=modify_fk_base_body_name,
+            fk_ee_link_names=modify_fk_ee_link_names,
+            backup_body_idx_motion=self.upper_force_keypoint_idx_motion,
+        )
+        self.modify_suitable_flags = self._compute_modify_suitable_flags()
+        self.step_schedule(0.0, None)
+
+    def step_schedule(self, progress: float, iters: int | None = None):
+        if self.env.student_train:
+            ramp = 1.0
+        else:
+            p = float(min(max(progress, 0.0), 1.0))
+            ramp = min(p / self.net_limit_full_progress, 1.0)
+        self.net_force_limit.copy_(self.net_force_limit_max * ramp)
+        self.net_torque_limit.copy_(self.net_torque_limit_max * ramp)
+
+    def _compute_modify_suitable_flags(self) -> torch.Tensor:
+        if not isinstance(self.dataset, ProgressiveMultiMotionDataset):
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        if self.feet_idx_motion.numel() == 0:
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        buf = self.dataset._buf_A
+        lengths = self.dataset._len_A.to(torch.long)
+        E, T = lengths.shape[0], buf.root_pos_w.shape[1]
+        t = torch.arange(T, device=self.device).unsqueeze(0).expand(E, T)
+        valid = t < lengths.unsqueeze(1)
+
+        root_z = buf.root_pos_w[:, :, 2]
+        root_speed = buf.root_lin_vel_w.norm(dim=-1)
+        root_angvel = buf.root_ang_vel_w.norm(dim=-1)
+        feet_z = buf.body_pos_w[:, :, self.feet_idx_motion, 2]
+
+        root_z_ok = (
+            ((root_z >= 0.6) & (root_z <= 0.85)) | (~valid)
+        ).all(dim=1)
+        root_speed_ok = ((root_speed < 2.0) | (~valid)).all(dim=1)
+        root_angvel_ok = ((root_angvel < 3.0) | (~valid)).all(dim=1)
+        feet_ok = ((feet_z < 0.35) | (~valid.unsqueeze(-1))).all(dim=(1, 2))
+
+        return root_z_ok & root_speed_ok & root_angvel_ok & feet_ok
+
+    def _maybe_resample_joint_modify(self, env_ids: torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+        env_ids = env_ids.to(self.device, dtype=torch.long)
+        due_mask = self.modify_countdown[env_ids] <= 0
+        if not due_mask.any():
+            return
+
+        due_env_ids = env_ids[due_mask]
+        self.compliance_flag[due_env_ids] = False
+        self.modify_countdown[due_env_ids] = self.modify_resample_countdown_steps
+
+        suitable_mask = self.modify_suitable_flags[due_env_ids]
+        candidate_env_ids = due_env_ids[suitable_mask]
+
+        if candidate_env_ids.numel() > 0:
+            prob_mask = torch.rand(candidate_env_ids.numel(), device=self.device) < self.modify_resample_prob
+            modify_env_ids = candidate_env_ids[prob_mask]
+            self.compliance_flag[modify_env_ids] = True
+        else:
+            modify_env_ids = candidate_env_ids
+
+        self.dataset.modify_joint(due_env_ids, modify_env_ids)
+
+    @observation
+    def raw_target_joint_pos_obs(self, noise_std: float = 0.0):
+        target_joint_pos = self._motion_original.joint_pos[:, :, self.target_joint_idx_motion]
+        current_joint_pos = self.asset.data.joint_pos[:, self.target_joint_idx_asset] - self.env.action_manager.offset[:, self.target_joint_idx_asset]
+        if noise_std > 0.0:
+            current_joint_pos = random_noise(current_joint_pos, noise_std)
+        current_joint_pos = current_joint_pos.unsqueeze(1) # N, 1, J
+        target_minus_current = target_joint_pos - current_joint_pos # N, T, J
+        return torch.cat(
+            [
+                target_joint_pos.reshape(self.num_envs, -1),
+                target_minus_current.reshape(self.num_envs, -1),
+            ],
+            dim=-1,
+        )
+    def raw_target_joint_pos_obs_sym(self):
+        transform = sym_utils.joint_space_symmetry(self.asset, self.target_joint_names).repeat(
+            len(self.future_steps)
+        )
+        return sym_utils.SymmetryTransform.cat([transform, transform])
+    
+    @observation
+    def compliance_flag_obs(self):
+        flag = self.compliance_flag.float().unsqueeze(-1)
+        return torch.cat(
+            [
+                flag,
+                self.force_threshold * flag,
+                self.force_kp * flag,
+            ],
+            dim=-1,
+        )
+    def compliance_flag_obs_sym(self):
+        return sym_utils.SymmetryTransform(perm=torch.arange(3), signs=[1., 1., 1.])
+
+    def sample_init(self, env_ids: torch.Tensor):
+        self._maybe_resample_joint_modify(env_ids)
+        return super().sample_init(env_ids)
+
+    def reset(self, env_ids: torch.Tensor):
+        super().reset(env_ids)
+        sampled_force_threshold = torch.rand(
+            (env_ids.numel(), 1), device=self.device, dtype=torch.float32
+        ) * (self.force_threshold_max - self.force_threshold_min) + self.force_threshold_min
+        self.force_threshold[env_ids] = sampled_force_threshold
+        self.force_kp[env_ids] = sampled_force_threshold / 0.05
+        self.upper_force_applied[env_ids] = 0.0
+        self.torso_force_applied[env_ids] = 0.0
+        self.torso_torque_applied[env_ids] = 0.0
+
+    def before_update(self):
+        super().before_update()
+        self.modify_countdown -= 1
+        self._motion_original = self.dataset.get_slice_original(None, self.t, steps=self.future_steps)
+        self._motion_modified_mask = self.dataset.get_slice_modified_mask(None, self.t, steps=self.future_steps)
+    
+    def step(self, substep):
+        super().step(substep)
+        raw_target_pos_torso = quat_apply_inverse(self._motion.body_quat_w[:, 0, self.torso_idx_motion], self._motion_original.body_pos_w[:, 0] - self._motion.body_pos_w[:, 0, self.torso_idx_motion])
+        modified_target_pos_torso = quat_apply_inverse(self._motion.body_quat_w[:, 0, self.torso_idx_motion], self._motion.body_pos_w[:, 0, self.upper_force_keypoint_idx_motion] - self._motion.body_pos_w[:, 0, self.torso_idx_motion])
+        current_target_pos_torso = quat_apply_inverse(
+            self.asset.data.body_link_quat_w[:, self.torso_idx_asset],
+            self.asset.data.body_link_pos_w[:, self.upper_force_keypoint_idx_asset] - self.asset.data.body_link_pos_w[:, self.torso_idx_asset]
+        )
+
+        upper_force_applied_torso = clamp_norm(
+            (modified_target_pos_torso - raw_target_pos_torso) * self.force_kp.unsqueeze(-1), self.force_threshold.unsqueeze(-1)
+        ) + clamp_norm((modified_target_pos_torso - current_target_pos_torso) * 100, 5.0)
+        active_force_mask = self.compliance_flag & self._motion_modified_mask[:, 0]
+        upper_force_applied_torso[~active_force_mask] = 0.0
+        self.upper_force_applied[:] = quat_apply(
+            self.asset.data.body_link_quat_w[:, self.torso_idx_asset],
+            upper_force_applied_torso
+        )
+        dist = rand_points_isotropic(current_target_pos_torso.shape[0], current_target_pos_torso.shape[1], 0.02, device=self.device)
+        torque_pull = self.upper_force_applied.cross(dist, dim=-1)
+
+        # Limit net wrench about torso and compensate exceeded part on torso.
+        upper_pos_w = self.asset.data.body_link_pos_w[:, self.upper_force_keypoint_idx_asset]
+        torso_pos_w = self.asset.data.body_link_pos_w[:, self.torso_idx_asset]
+        r_w = upper_pos_w - torso_pos_w
+        force_net_w = self.upper_force_applied.sum(dim=1)
+        torque_net_w = torch.cross(r_w, self.upper_force_applied, dim=-1).sum(dim=1) + torque_pull.sum(dim=1)
+        force_allow_w = clamp_norm(force_net_w, self.net_force_limit)
+        torque_allow_w = clamp_norm(torque_net_w, self.net_torque_limit)
+        self.torso_force_applied[:] = force_allow_w - force_net_w
+        self.torso_torque_applied[:] = torque_allow_w - torque_net_w
+
+        force_all = torch.cat([self.upper_force_applied, self.torso_force_applied.unsqueeze(1)], dim=1)
+        torque_all = torch.cat([torque_pull, self.torso_torque_applied.unsqueeze(1)], dim=1)
+        body_ids_all = torch.cat([self.upper_force_keypoint_idx_asset, self.torso_idx_asset], dim=0)
+        self.asset.write_external_wrench_to_sim(forces=force_all, torques=torque_all, body_ids=body_ids_all)
+        
+    
+    def debug_draw(self):
+        super().debug_draw()
+        if self.compliance_flag.any():
+            active_mask = self.compliance_flag
+            marker_pos = self.asset.data.root_link_pos_w[active_mask].clone()
+            marker_pos[:, 2] += 0.5
+            self.env.debug_draw.point(
+                marker_pos,
+                color=(0, 0, 1, 1),
+                size=20.0,
+            )
+            force_vis_scale = 0.02
+            upper_pos_w = self.asset.data.body_link_pos_w[active_mask][:, self.upper_force_keypoint_idx_asset]
+            upper_force_w = self.upper_force_applied[active_mask] * force_vis_scale
+            self.env.debug_draw.vector(
+                upper_pos_w.reshape(-1, 3),
+                upper_force_w.reshape(-1, 3),
+                color=(0, 0.8, 1, 1),
+            )
+            torso_pos_w = self.asset.data.body_link_pos_w[active_mask][:, self.torso_idx_asset]
+            torso_force_w = self.torso_force_applied[active_mask].unsqueeze(1) * force_vis_scale
+            self.env.debug_draw.vector(
+                torso_pos_w.reshape(-1, 3),
+                torso_force_w.reshape(-1, 3),
+                color=(1, 0.4, 0, 1),
+            )
+        if not hasattr(self, "_motion_original"):
+            return
+        origin_upper_pos_w = self._motion_original.body_pos_w[:, 0] + self.env.scene.env_origins.unsqueeze(1)
+        self.env.debug_draw.point(
+            origin_upper_pos_w.reshape(-1, 3),
+            color=(0, 1, 0, 1),
+            size=20.0,
+        )

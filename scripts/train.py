@@ -21,11 +21,11 @@ from setproctitle import setproctitle
 import torch.distributed as dist
 
 import active_adaptation as aa
-from isaaclab.app import AppLauncher
 from active_adaptation.utils.torchrl import SyncDataCollector, TDTimeBuffer
 
 # local import
 from scripts.utils.helpers import make_env_policy, EpisodeStats, evaluate
+from scripts.utils.train_record import TrainStateRecorder
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -45,12 +45,6 @@ def main(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
     
     print(f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}")
-    app_launcher = AppLauncher(
-        OmegaConf.to_container(cfg.app),
-        distributed=aa.is_distributed(),
-        device=f"cuda:{aa.get_local_rank()}"
-    )
-    simulation_app = app_launcher.app
     if aa.is_distributed():
         dist.init_process_group(
             backend="nccl",
@@ -139,8 +133,27 @@ def main(cfg: DictConfig):
     T = cfg.algo.train_every
     data_buf = TDTimeBuffer(N, T, device=policy.device)
 
+    train_recorder = None
+    if aa.is_main_process():
+        train_record_cfg = cfg.get("train_record", {})
+        record_output_dir = train_record_cfg.get("output_dir", "train_records")
+        if not os.path.isabs(record_output_dir):
+            record_output_dir = os.path.join(os.getcwd(), record_output_dir)
+        train_recorder = TrainStateRecorder(
+            env,
+            interval=int(train_record_cfg.get("interval", 0)),
+            num_envs=int(train_record_cfg.get("envs", 16)),
+            num_steps=int(train_record_cfg.get("steps", 256)),
+            output_dir=record_output_dir,
+            seed=int(cfg.seed),
+            start_iter=int(start_iter),
+            enabled=True,
+        )
+
     for i in progress:
         start = time.perf_counter()
+        if train_recorder is not None:
+            train_recorder.maybe_start(i)
 
         with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
             torch.compiler.cudagraph_mark_step_begin() # for compiled policy
@@ -148,6 +161,9 @@ def main(cfg: DictConfig):
                 carry = rollout_policy(carry)
 
                 td, carry = env.step_and_maybe_reset(carry)
+                if train_recorder is not None:
+                    rollout_step = (start_iter + i) * cfg.algo.train_every + t
+                    train_recorder.on_step(i, rollout_step)
 
                 # deal with value
                 policy.critic(td)
@@ -202,6 +218,9 @@ def main(cfg: DictConfig):
             print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, (float, int))}))
     
     if aa.is_main_process():
+        if train_recorder is not None:
+            train_recorder.flush()
+
         save(policy, "checkpoint_final")
 
         policy_eval = policy.get_rollout_policy("eval")

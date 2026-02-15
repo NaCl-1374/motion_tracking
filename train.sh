@@ -10,9 +10,9 @@ SCRIPT="scripts/train.py"
 run_pipeline() {
   local TASK="$1" TAG="$2" SUFFIX="$3"
 
-  local ID_TRAIN="${TAG}_train_${SUFFIX}-$(random_suffix)"
-  local ID_ADAPT="${TAG}_adapt_${SUFFIX}-$(random_suffix)"
-  local ID_FINETUNE="${TAG}_finetune_${SUFFIX}-$(random_suffix)"
+  local ID_TRAIN="${TAG}_train_${SUFFIX}"
+  local ID_ADAPT="${TAG}_adapt_${SUFFIX}"
+  local ID_FINETUNE="${TAG}_finetune_${SUFFIX}"
 
   # ---------- TRAIN ----------
   cmd=(uv run torchrun --nproc_per_node="$NPROC" "$SCRIPT"

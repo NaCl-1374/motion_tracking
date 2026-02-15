@@ -9,7 +9,6 @@ import argparse
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from omegaconf import OmegaConf
-from isaaclab.app import AppLauncher
 from scripts.utils.play import play
 from scripts.utils.eval import eval
 

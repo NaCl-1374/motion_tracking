@@ -21,6 +21,12 @@ vecnorm: ${oc.select:algo.vecnorm,train}
 
 camera_follow: false
 
+train_record:
+  interval: 50
+  envs: 16
+  steps: 500
+  output_dir: train_records
+
 wandb:
   name: ${..exp_name}/${now:%m-%d}_${now:%H-%M}
   job_type: train

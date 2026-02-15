@@ -16,7 +16,7 @@ from common.math_utils import (
     _yaw_component_wxyz,
     _zero_z,
 )
-from common.utils import DictToClass, MotionUDPServer, joint_names_23, joint_names_29
+from common.utils import DictToClass, MotionUDPServer
 from paths import ASSETS_DIR, REAL_G1_ROOT
 
 def benchmark_onnx(module, sample_input, runs=100, warmup=10, desc=""):
@@ -195,33 +195,43 @@ class Policy:
 # =========================================
 # Policy Subclasses
 # =========================================
-def mapping_joints(data: np.ndarray, target: List[str]):
-    nums = data.shape[-1]
-    if nums == len(target):
-        return data
-    if nums == 29:
-        current = joint_names_29
-        print("[Mapping] from 29 to 23")
-    elif nums == 23:
-        current = joint_names_23
-        print("[Mapping] from 23 to 29")
-    else:
-        raise ValueError(f"Unsupported number of joints: {nums}")
+def remap_joint_array_by_names(
+    data: np.ndarray,
+    source_joint_names: List[str],
+    target_joint_names: List[str],
+) -> np.ndarray:
+    data = np.asarray(data, dtype=np.float32)
+    if data.ndim != 2:
+        raise ValueError(f"Expected 2D joint array [T, J], got shape={data.shape}")
+    if data.shape[1] != len(source_joint_names):
+        raise ValueError(
+            f"Joint dim mismatch: data has {data.shape[1]} dims, "
+            f"but source_joint_names has {len(source_joint_names)} names."
+        )
 
-    new_data = np.zeros((data.shape[0], len(target)), dtype=np.float32)
-    for i, name in enumerate(target):
-        if name in current:
-            new_data[:, i] = data[:, current.index(name)]
-    return new_data.astype(np.float32)
+    name_to_idx = {name: i for i, name in enumerate(source_joint_names)}
+    remap = np.zeros((data.shape[0], len(target_joint_names)), dtype=np.float32)
+    for i, name in enumerate(target_joint_names):
+        j = name_to_idx.get(name, None)
+        if j is not None:
+            remap[:, i] = data[:, j]
+    return remap
 
 class TrackingPolicyRaw(Policy):
     def __init__(self, name: str, policy_cfg: DictToClass, controller):
         # ---- Config ---------------------------------------------------------
         self.body_name = "torso_link"
         self.transition_steps = int(getattr(policy_cfg, "transition_steps", 100))
+        self.compliance_flag_value = float(getattr(policy_cfg, "compliance_flag_value", 0.0))
         self.udp_enable = bool(getattr(policy_cfg, "udp_enable", True))
         self.udp_host = str(getattr(policy_cfg, "udp_host", "127.0.0.1"))
         self.udp_port = int(getattr(policy_cfg, "udp_port", 28562))
+        self.dataset_joint_names = list(getattr(policy_cfg, "dataset_joint_names", []))
+        if len(self.dataset_joint_names) == 0:
+            raise ValueError(
+                "[TrackingPolicyRaw] dataset_joint_names must be provided in tracking.yaml."
+            )
+        self.obs_joint_names = controller.config.isaac_joint_names_state
 
         # ---- Load motions; keep all root data (no yaw split) ----------------
         self.motions: Dict[str, Dict[str, np.ndarray]] = {}
@@ -242,17 +252,18 @@ class TrackingPolicyRaw(Policy):
             root_quat = np.concatenate([root_rot_xyzw[:, 3:4], root_rot_xyzw[:, :3]], axis=-1)
 
             joint_names = data.get("joint_names", None)
-            if joint_names is not None:
-                joint_names = joint_names.tolist()
-                target_names = list(policy_cfg.dataset_joint_names)
-                if joint_names != target_names:
-                    name_to_idx = {n: i for i, n in enumerate(joint_names)}
-                    remap = np.zeros((joint_pos.shape[0], len(target_names)), dtype=np.float32)
-                    for i, n in enumerate(target_names):
-                        j = name_to_idx.get(n, None)
-                        if j is not None:
-                            remap[:, i] = joint_pos[:, j]
-                    joint_pos = remap
+            if joint_names is None:
+                raise ValueError(
+                    f"[TrackingPolicyRaw] Motion '{motion_name}' is missing 'joint_names' in npz. "
+                    "Please export joint_names with the dataset."
+                )
+            source_joint_names = []
+            for n in joint_names.tolist():
+                if isinstance(n, (bytes, np.bytes_)):
+                    source_joint_names.append(n.decode("utf-8"))
+                else:
+                    source_joint_names.append(str(n))
+            joint_pos = remap_joint_array_by_names(joint_pos, source_joint_names, self.obs_joint_names)
 
             self.motions[motion_name] = {
                 "joint_pos": joint_pos,  # (T,J)
@@ -264,10 +275,14 @@ class TrackingPolicyRaw(Policy):
         for m in policy_cfg.motion_clips:
             mc = DictToClass(m)
             motion_name = mc.name
-            joint_pos_1 = mapping_joints(
-                np.asarray(mc.joint_pos, dtype=np.float32).reshape(1, -1),
-                policy_cfg.dataset_joint_names
-            )
+            joint_pos_1 = np.asarray(mc.joint_pos, dtype=np.float32).reshape(1, -1)
+            if joint_pos_1.shape[1] != len(self.dataset_joint_names):
+                raise ValueError(
+                    f"[TrackingPolicyRaw] Motion clip '{motion_name}' dim={joint_pos_1.shape[1]} "
+                    f"does not match dataset_joint_names size={len(self.dataset_joint_names)}."
+                )
+            source_joint_names = self.dataset_joint_names
+            joint_pos_1 = remap_joint_array_by_names(joint_pos_1, source_joint_names, self.obs_joint_names)
             root_quat_1 = np.asarray(mc.root_quat, dtype=np.float32).reshape(1, 4)
             root_pos_1 = np.asarray(mc.root_pos, dtype=np.float32).reshape(1, 3)
 
@@ -291,7 +306,7 @@ class TrackingPolicyRaw(Policy):
         self.current_done: bool = True  # boot: default done
 
         # ---- Misc ----------------------------------------------------------
-        self.n_joints = len(policy_cfg.dataset_joint_names)
+        self.n_joints = len(self.obs_joint_names)
 
         # Optional UDP selector
         self._udp_server: Optional[MotionUDPServer] = None
@@ -332,12 +347,14 @@ class TrackingPolicyRaw(Policy):
             JointPos,
             PrevActions,
             BootIndicator,
+            ComplianceFlagObs,
         )
         self.obs_modules = [
             BootIndicator(),
             TrackingCommandObsRaw(self.controller, self),
-            TargetRootZObs(self),
+            ComplianceFlagObs(self),
             TargetJointPosObs(self),
+            TargetRootZObs(self),
             TargetProjectedGravityBObs(self),
             RootAngVelB(self.controller),
             ProjectedGravityB(self.controller),
@@ -371,15 +388,7 @@ class TrackingPolicyRaw(Policy):
         super().update_obs()
 
     def _read_current_state(self) -> Dict[str, np.ndarray]:
-        q_real = self.controller.qj_real.copy()
-        real_names = list(self.controller.config.real_joint_names)
-        target_names = list(self.config.dataset_joint_names)
-        name_to_idx = {n: i for i, n in enumerate(real_names)}
-        q_policy = np.zeros(len(target_names), dtype=np.float32)
-        for i, n in enumerate(target_names):
-            j = name_to_idx.get(n, None)
-            if j is not None and j < q_real.shape[0]:
-                q_policy[i] = q_real[j]
+        q_policy = self.controller.qj_isaac.copy().astype(np.float32)
 
         if self.ref_root_pos is not None:
             root_pos = self.ref_root_pos[self.ref_idx]
@@ -388,7 +397,7 @@ class TrackingPolicyRaw(Policy):
             root_pos = np.array([0.0, 0.0, 0.78], dtype=np.float32)
             root_quat = self.controller.quat.copy()
         return {
-            "joint_pos": q_policy.astype(np.float32),
+            "joint_pos": q_policy,
             "root_pos": root_pos,
             "root_quat": root_quat,
         }

@@ -1,14 +1,10 @@
 import torch
-import carb
-import omni
-import weakref
-
 from active_adaptation.utils.math import quat_mul
 from typing import Sequence, TYPE_CHECKING
 from collections import defaultdict
 
 if TYPE_CHECKING:
-    from isaaclab.assets import Articulation
+    from mjlab.entity import Entity as Articulation
     from active_adaptation.envs.locomotion import SimpleEnv
 
 class Command:
@@ -16,7 +12,7 @@ class Command:
         self.env: SimpleEnv = env
         self.asset: Articulation = env.scene["robot"]
         self.init_root_state = self.asset.data.default_root_state.clone()
-        self.init_root_state[:, 3:7] = self.asset.data.root_state_w[:, 3:7]
+        self.init_root_state[:, 3:7] = self.asset.data.root_link_quat_w[:, 3:7]
         self.init_joint_pos = self.asset.data.default_joint_pos.clone()
         self.init_joint_vel = self.asset.data.default_joint_vel.clone()
 
