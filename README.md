@@ -22,6 +22,7 @@ For detailed information about the code architecture, call flow, and training pr
 
 - 📖 **[Architecture Documentation (English)](docs/ARCHITECTURE.md)** - Comprehensive guide to the codebase structure, training pipeline, and component relationships
 - 📖 **[架构文档（中文）](docs/ARCHITECTURE_CN.md)** - 代码结构、训练流程和组件关系的详细指南
+- ⚡ **[Quick Reference](docs/QUICK_REFERENCE.md)** - Fast reference for training pipeline, commands, and troubleshooting
 
 ## Installation
 
