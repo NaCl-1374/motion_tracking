@@ -63,12 +63,10 @@ motion_tracking/
 │   │   ├── train.yaml       # 阶段 1：训练
 │   │   ├── adapt.yaml       # 阶段 2：适应
 │   │   └── finetune.yaml    # 阶段 3：微调
-│   ├── task/                # 任务特定配置
-│   │   └── G1/             # G1 人形机器人
-│   └── algo/               # 算法配置
-│       ├── ppo_train.yaml
-│       ├── ppo_adapt.yaml
-│       └── ppo_finetune.yaml
+│   └── task/                # 任务特定配置
+│       └── G1/              # G1 人形机器人
+│           ├── G1.yaml      # 基础 G1 配置
+│           └── G1_tracking.yaml  # 运动跟踪任务
 └── train.sh                 # 流水线编排脚本
 ```
 
@@ -679,33 +677,46 @@ class SymmetryTransform:
 
 ### 训练超参数
 
-**PPO 算法**（`cfg/algo/ppo_train.yaml`）：
-```yaml
-ppo_epochs: 5                    # 每批次的 epoch
-num_minibatches: 8               # 每 epoch 的小批次数
-train_every: 32                  # 推演长度（训练阶段）
-clip_param: 0.2                  # PPO 裁剪参数
-lr: 5e-4                         # 学习率（训练阶段）
-entropy_coef: 0.005              # 熵正则化
-value_coef: 1.0                  # 价值损失系数
-max_grad_norm: 1.0               # 梯度裁剪
-gamma: 0.99                      # 折扣因子
-gae_lambda: 0.95                 # GAE lambda
+**PPO 算法**（定义在 `active_adaptation/learning/ppo/ppo.py` 中）：
+```python
+# ppo_train 配置（通过 Hydra ConfigStore 注册）
+PPOConfig(
+    phase="train", 
+    vecnorm="train",
+    ppo_epochs=5,                    # 每批次的 epoch
+    num_minibatches=8,               # 每 epoch 的小批次数
+    train_every=32,                  # 推演长度（训练阶段）
+    clip_param=0.2,                  # PPO 裁剪参数
+    lr=5e-4,                         # 学习率（训练阶段）
+    entropy_coef_start=0.01,         # 初始熵正则化
+    entropy_coef_end=0.0025,         # 最终熵正则化
+    gamma=0.99,                      # 折扣因子（隐式）
+    gae_lambda=0.95,                 # GAE lambda（隐式）
+    reg_lambda=0.2,                  # 蒸馏权重
+)
 ```
 
-**适应阶段**（`cfg/algo/ppo_adapt.yaml`）：
-```yaml
-train_every: 16                  # 更短的推演
-lr: 2e-4                         # 更低的学习率
-reg_lambda: 0.2                  # 蒸馏权重
-student_train: true              # 启用学生训练
+**适应阶段**（注册为 `ppo_adapt`）：
+```python
+PPOConfig(
+    phase="adapt",
+    vecnorm="eval",
+    train_every=16,                  # 更短的推演
+    lr=5e-4,                         # 相同学习率
+    reg_lambda=0.2,                  # 蒸馏权重
+)
 ```
 
-**微调阶段**（`cfg/algo/ppo_finetune.yaml`）：
-```yaml
-lr: 1e-4                         # 更低的学习率
-train_every: 16
-student_train: true
+**微调阶段**（注册为 `ppo_finetune`）：
+```python
+PPOConfig(
+    phase="finetune",
+    vecnorm="eval",
+    lr=1e-4,                         # 更低的学习率
+    train_every=16,
+    entropy_coef_start=0.0025,       # 更低的熵
+    entropy_coef_end=0.0005,
+)
 ```
 
 ### 环境参数

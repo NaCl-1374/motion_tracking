@@ -63,12 +63,10 @@ motion_tracking/
 │   │   ├── train.yaml       # Stage 1: Train
 │   │   ├── adapt.yaml       # Stage 2: Adapt
 │   │   └── finetune.yaml    # Stage 3: Finetune
-│   ├── task/                # Task-specific configs
-│   │   └── G1/             # G1 humanoid robot
-│   └── algo/               # Algorithm configs
-│       ├── ppo_train.yaml
-│       ├── ppo_adapt.yaml
-│       └── ppo_finetune.yaml
+│   └── task/                # Task-specific configs
+│       └── G1/              # G1 humanoid robot
+│           ├── G1.yaml      # Base G1 config
+│           └── G1_tracking.yaml  # Motion tracking task
 └── train.sh                 # Pipeline orchestration script
 ```
 
@@ -679,33 +677,46 @@ class SymmetryTransform:
 
 ### Training Hyperparameters
 
-**PPO Algorithm** (`cfg/algo/ppo_train.yaml`):
-```yaml
-ppo_epochs: 5                    # Epochs per batch
-num_minibatches: 8               # Minibatches per epoch
-train_every: 32                  # Rollout length (train phase)
-clip_param: 0.2                  # PPO clipping parameter
-lr: 5e-4                         # Learning rate (train phase)
-entropy_coef: 0.005              # Entropy regularization
-value_coef: 1.0                  # Value loss coefficient
-max_grad_norm: 1.0               # Gradient clipping
-gamma: 0.99                      # Discount factor
-gae_lambda: 0.95                 # GAE lambda
+**PPO Algorithm** (defined in `active_adaptation/learning/ppo/ppo.py`):
+```python
+# ppo_train config (registered via Hydra ConfigStore)
+PPOConfig(
+    phase="train", 
+    vecnorm="train",
+    ppo_epochs=5,                    # Epochs per batch
+    num_minibatches=8,               # Minibatches per epoch
+    train_every=32,                  # Rollout length (train phase)
+    clip_param=0.2,                  # PPO clipping parameter
+    lr=5e-4,                         # Learning rate (train phase)
+    entropy_coef_start=0.01,         # Initial entropy regularization
+    entropy_coef_end=0.0025,         # Final entropy regularization
+    gamma=0.99,                      # Discount factor (implicit)
+    gae_lambda=0.95,                 # GAE lambda (implicit)
+    reg_lambda=0.2,                  # Distillation weight
+)
 ```
 
-**Adaptation Phase** (`cfg/algo/ppo_adapt.yaml`):
-```yaml
-train_every: 16                  # Shorter rollouts
-lr: 2e-4                         # Lower learning rate
-reg_lambda: 0.2                  # Distillation weight
-student_train: true              # Enable student training
+**Adaptation Phase** (registered as `ppo_adapt`):
+```python
+PPOConfig(
+    phase="adapt",
+    vecnorm="eval",
+    train_every=16,                  # Shorter rollouts
+    lr=5e-4,                         # Same learning rate
+    reg_lambda=0.2,                  # Distillation weight
+)
 ```
 
-**Finetune Phase** (`cfg/algo/ppo_finetune.yaml`):
-```yaml
-lr: 1e-4                         # Even lower learning rate
-train_every: 16
-student_train: true
+**Finetune Phase** (registered as `ppo_finetune`):
+```python
+PPOConfig(
+    phase="finetune",
+    vecnorm="eval",
+    lr=1e-4,                         # Lower learning rate
+    train_every=16,
+    entropy_coef_start=0.0025,       # Lower entropy
+    entropy_coef_end=0.0005,
+)
 ```
 
 ### Environment Parameters
