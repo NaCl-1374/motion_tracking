@@ -97,11 +97,14 @@ The project uses a **three-stage training pipeline** to enable teacher-student k
 - **Loads**: Checkpoint from Stage 1
 - **Networks Active**:
   - `adapt_module`: Learns to predict privileged features from policy obs
-  - `actor_student`: Distilled policy (learns from teacher)
-  - `actor_teacher`: Frozen (used for distillation target)
-  - `critic`: Continues training
+  - `actor_student`: Used for rollout (frozen during this phase)
+  - `actor_teacher`: Frozen (not used)
+  - `critic`: Frozen (not trained in this phase)
 - **Rollout Policy**: `[adapt_module, actor_student]`
-- **Optimization**: Updates student actor and adaptation module
+- **Optimization**: **Only trains adaptation module** via MSE loss between predicted and true privileged features
+  - Does NOT perform PPO updates in this phase
+  - Student actor and critic remain frozen
+  - Trains for 2 mini-epochs per rollout
 
 ### Stage 3: FINETUNE (4B frames)
 **Purpose**: Finetune the student policy for final performance
@@ -111,10 +114,12 @@ The project uses a **three-stage training pipeline** to enable teacher-student k
 - **Loads**: Checkpoint from Stage 2
 - **Networks Active**:
   - `adapt_module`: Frozen (provides estimated privileged features)
-  - `actor_student`: Continues finetuning
-  - `critic`: Continues training
+  - `actor_student`: Trained via PPO
+  - `critic`: Trained via PPO
 - **Rollout Policy**: `[adapt_module, actor_student]`
-- **Optimization**: Updates student actor and critic
+- **Optimization**: PPO updates for student actor and critic
+  - First 2.5% of training: Critic-only warmup
+  - Remaining 97.5%: Joint actor-critic PPO updates
 
 ### Pipeline Orchestration
 
@@ -315,18 +320,20 @@ main(cfg)
        │         │    └─► _update_teacher(data)
        │         │         ├─► Compute advantages (GAE)
        │         │         ├─► PPO updates (teacher + critic)
-       │         │         └─► Train estimator (parallel)
+       │         │         └─► Train estimator (adaptation module)
        │         │
        │         ├─► Phase: ADAPT
-       │         │    └─► _update_student(data)
-       │         │         ├─► Compute advantages (GAE)
-       │         │         ├─► PPO updates (student + critic)
-       │         │         └─► Distillation loss from teacher
+       │         │    └─► train_estimator(data)
+       │         │         ├─► Forward: encoder_priv → priv_features
+       │         │         ├─► Forward: adapt_module → priv_pred
+       │         │         └─► MSE loss between priv_pred and priv_features
+       │         │              (NO PPO updates, only adaptation module trained)
        │         │
        │         └─► Phase: FINETUNE
-       │              └─► _update2(data)
-       │                   ├─► Compute advantages (GAE)
-       │                   └─► PPO updates (student + critic)
+       │              └─► _ppo_update(data, update_student)
+       │                   ├─► First 2.5%: Critic-only warmup
+       │                   ├─► After 2.5%: Full actor-critic PPO
+       │                   └─► Compute advantages (GAE)
        │
        ├─► LOGGING
        │    ├─► episode_stats.add(data)
@@ -746,16 +753,16 @@ randomize_com: true
 
 The motion tracking codebase implements a sophisticated teacher-student framework:
 
-1. **Teacher Training**: Learns a robust policy using privileged information (ground truth dynamics, friction, etc.)
+1. **Teacher Training (Stage 1)**: Learns a robust policy using privileged information (ground truth dynamics, friction, etc.). Simultaneously trains the adaptation module to predict privileged features from policy observations.
 
-2. **Adaptation**: Trains an estimator to predict privileged features from sensor observations, enabling deployment without privileged info
+2. **Adaptation (Stage 2)**: Focuses exclusively on training the adaptation module via supervised learning (MSE loss). The module learns to estimate privileged features from observable sensor data. The student actor and critic remain frozen during this phase, using weights from Stage 1.
 
-3. **Student Finetuning**: Polishes the student policy for final performance
+3. **Student Finetuning (Stage 3)**: Uses the frozen adaptation module to provide estimated privileged features, then trains the student actor and critic via PPO. Includes a 2.5% critic-only warmup period before full actor-critic training.
 
 The architecture is modular and extensible:
 - **Environment**: Physics simulation with MDP components
-- **Learning**: PPO algorithm with distillation
+- **Learning**: PPO algorithm with privileged information estimation
 - **Data**: Efficient TensorDict-based data flow
 - **Config**: Hydra-based configuration system
 
-This design enables robust sim-to-real transfer for complex humanoid motion tracking tasks.
+This design enables robust sim-to-real transfer for complex humanoid motion tracking tasks through a carefully staged training process that progressively transitions from privileged to sensory-only observations.

@@ -97,11 +97,14 @@ motion_tracking/
 - **加载**：阶段 1 的检查点
 - **激活的网络**：
   - `adapt_module`：学习从策略观测预测特权特征
-  - `actor_student`：蒸馏策略（从教师学习）
-  - `actor_teacher`：冻结（用于蒸馏目标）
-  - `critic`：继续训练
+  - `actor_student`：用于推演（此阶段冻结）
+  - `actor_teacher`：冻结（不使用）
+  - `critic`：冻结（此阶段不训练）
 - **推演策略**：`[adapt_module, actor_student]`
-- **优化**：更新学生 actor 和适应模块
+- **优化**：**仅训练适应模块**，通过预测和真实特权特征之间的 MSE 损失
+  - 此阶段不执行 PPO 更新
+  - 学生 actor 和 critic 保持冻结
+  - 每次推演训练 2 个小 epoch
 
 ### 阶段 3：微调（FINETUNE）（40亿帧）
 **目的**：微调学生策略以获得最终性能
@@ -111,10 +114,12 @@ motion_tracking/
 - **加载**：阶段 2 的检查点
 - **激活的网络**：
   - `adapt_module`：冻结（提供估计的特权特征）
-  - `actor_student`：继续微调
-  - `critic`：继续训练
+  - `actor_student`：通过 PPO 训练
+  - `critic`：通过 PPO 训练
 - **推演策略**：`[adapt_module, actor_student]`
-- **优化**：更新学生 actor 和 critic
+- **优化**：对学生 actor 和 critic 进行 PPO 更新
+  - 训练的前 2.5%：仅 Critic 预热
+  - 剩余 97.5%：联合 actor-critic PPO 更新
 
 ### 流水线编排
 
@@ -315,18 +320,20 @@ main(cfg)
        │         │    └─► _update_teacher(data)
        │         │         ├─► 计算优势（GAE）
        │         │         ├─► PPO 更新（教师 + critic）
-       │         │         └─► 训练估计器（并行）
+       │         │         └─► 训练估计器（适应模块）
        │         │
        │         ├─► 阶段：ADAPT
-       │         │    └─► _update_student(data)
-       │         │         ├─► 计算优势（GAE）
-       │         │         ├─► PPO 更新（学生 + critic）
-       │         │         └─► 从教师蒸馏损失
+       │         │    └─► train_estimator(data)
+       │         │         ├─► 前向：encoder_priv → priv_features
+       │         │         ├─► 前向：adapt_module → priv_pred
+       │         │         └─► priv_pred 和 priv_features 之间的 MSE 损失
+       │         │              （无 PPO 更新，仅训练适应模块）
        │         │
        │         └─► 阶段：FINETUNE
-       │              └─► _update2(data)
-       │                   ├─► 计算优势（GAE）
-       │                   └─► PPO 更新（学生 + critic）
+       │              └─► _ppo_update(data, update_student)
+       │                   ├─► 前 2.5%：仅 Critic 预热
+       │                   ├─► 2.5% 之后：完整 actor-critic PPO
+       │                   └─► 计算优势（GAE）
        │
        ├─► 日志记录
        │    ├─► episode_stats.add(data)
@@ -746,16 +753,16 @@ randomize_com: true
 
 运动跟踪代码库实现了一个复杂的教师-学生框架：
 
-1. **教师训练**：使用特权信息（真实动力学、摩擦等）学习鲁棒策略
+1. **教师训练（阶段 1）**：使用特权信息（真实动力学、摩擦等）学习鲁棒策略。同时训练适应模块从策略观测预测特权特征。
 
-2. **适应**：训练估计器从传感器观测预测特权特征，使无需特权信息即可部署
+2. **适应（阶段 2）**：专注于通过监督学习（MSE 损失）训练适应模块。该模块学习从可观测的传感器数据估计特权特征。此阶段学生 actor 和 critic 保持冻结，使用阶段 1 的权重。
 
-3. **学生微调**：打磨学生策略以获得最终性能
+3. **学生微调（阶段 3）**：使用冻结的适应模块提供估计的特权特征，然后通过 PPO 训练学生 actor 和 critic。包括 2.5% 的仅 critic 预热期，然后进行完整的 actor-critic 训练。
 
 架构模块化且可扩展：
 - **环境**：带 MDP 组件的物理仿真
-- **学习**：带蒸馏的 PPO 算法
+- **学习**：带特权信息估计的 PPO 算法
 - **数据**：基于 TensorDict 的高效数据流
 - **配置**：基于 Hydra 的配置系统
 
-这种设计使复杂的人形运动跟踪任务能够进行鲁棒的 sim-to-real 迁移。
+这种设计通过精心设计的分阶段训练过程，使复杂的人形运动跟踪任务能够进行鲁棒的 sim-to-real 迁移，该过程逐步从特权观测过渡到仅传感器观测。
