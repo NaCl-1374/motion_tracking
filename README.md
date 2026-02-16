@@ -16,6 +16,14 @@ https://github.com/user-attachments/assets/4d210dbf-8023-4270-b094-ab6a2353deda
 
 Instructions for **real-robot deployment** and the use of **pretrained models** on new motion sequences are available in `sim2real` folder.
 
+## Documentation
+
+For detailed information about the code architecture, call flow, and training process:
+
+- 📖 **[Architecture Documentation (English)](docs/ARCHITECTURE.md)** - Comprehensive guide to the codebase structure, training pipeline, and component relationships
+- 📖 **[架构文档（中文）](docs/ARCHITECTURE_CN.md)** - 代码结构、训练流程和组件关系的详细指南
+- ⚡ **[Quick Reference](docs/QUICK_REFERENCE.md)** - Fast reference for training pipeline, commands, and troubleshooting
+
 ## Installation
 
 If you do not have `uv` installed, you can install it following the instructions in the [uv documentation](https://docs.astral.sh/uv/getting-started/installation/).
